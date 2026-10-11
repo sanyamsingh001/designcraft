@@ -1801,6 +1801,12 @@ pub fn close_document(app: &mut DesignApp, index: Option<usize>) {
 /// A menu item was chosen. An engine command whose label ends in "…" and that takes parameters
 /// opens a dialog built from its parameter documentation (see [`crate::dialogs::command_fields`]).
 pub fn activate(app: &mut DesignApp, id: &str, params: &Value) {
+    if params.is_null() && id == "edit.paste" && app.session.wants_text() {
+        // User Paste must read the system clipboard before the engine can choose a payload.
+        // Explicit app.run/engine calls with no text keep their internal-clipboard semantics.
+        app.queue_clipboard_paste();
+        return;
+    }
     if params.is_null() && id == "file.close" {
         close_document(app, None);
         return;

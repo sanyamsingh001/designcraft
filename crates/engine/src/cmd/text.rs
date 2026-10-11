@@ -1867,6 +1867,9 @@ mod vertical_caret_tests {
         assert_eq!(mv(&mut s, "up", false, false), 3 * c);
     }
 }
+#[cfg(test)]
+#[path = "text/tests_payload.rs"]
+mod tests_payload;
 
 #[cfg(test)]
 mod story_query_contract_tests {

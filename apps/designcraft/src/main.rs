@@ -18,10 +18,39 @@ mod logging;
 mod native_menu;
 
 use designcraft_engine::Session;
-use designcraft_ui_egui::{DesignApp, Services};
+use designcraft_ui_egui::{DesignApp, PasteRequest, Services};
+use egui_winit::winit::raw_window_handle::HasDisplayHandle;
+
+struct NativeClipboard {
+    adapter: std::sync::Mutex<egui_winit::clipboard::Clipboard>,
+    // The output plugin shares this owner; the adapter must drop before the window.
+    _window: Option<std::sync::Arc<egui_winit::winit::window::Window>>,
+}
+
+// Copy at the backend handoff, after selectable labels emit their late output.
+// Mirroring in a later frame could overwrite a newer external clipboard value.
+struct NativeClipboardOutput<F>(F);
+
+impl<F: FnMut(&str) + Send + Sync + 'static> egui::Plugin for NativeClipboardOutput<F> {
+    fn debug_name(&self) -> &'static str {
+        "Native clipboard output"
+    }
+
+    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
+        if let Some(text) = output.platform_output.commands.iter().rev().find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text),
+            _ => None,
+        }) {
+            (self.0)(text);
+        }
+    }
+}
 
 struct App {
     app: DesignApp,
+    clipboard: std::sync::Arc<NativeClipboard>,
+    paste_requests: std::sync::mpsc::Receiver<PasteRequest>,
+    paste_completions: Vec<(PasteRequest, String)>,
     #[cfg(target_os = "macos")]
     menu: Option<native_menu::NativeMenu>,
     /// The graphics start in progress (`gpu.json`) until a frame has been presented; see `gpu`.
@@ -53,10 +82,23 @@ impl eframe::App for App {
         self.app.logic(ctx);
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // Read once before the UI passes, after the previous frame's complete
+        // clipboard output. Keyboard Paste remains ordinary input.
+        while let Ok(request) = self.paste_requests.try_recv() {
+            let text = self.clipboard.adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get();
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                self.paste_completions.push((request, text.replace("\r\n", "\n")));
+            }
+        }
         self.app.raw_input_hook(raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
+        // Process current keyboard/canvas input before checking the captured target.
+        for (request, text) in self.paste_completions.drain(..) {
+            self.app.receive_clipboard_paste(ui.ctx(), request, text);
+            ui.ctx().request_repaint();
+        }
     }
     fn on_exit(&mut self) {
         // A normal exit before the third frame is not a crash.
@@ -306,7 +348,22 @@ fn main() -> eframe::Result {
             // Crash recovery: reopen what a previous run left unsaved, then keep it current.
             session.recovery_dir = designcraft_engine::recovery::default_dir();
             let recovered = session.execute("file.recovery.open", &serde_json::json!({})).ok();
-            let mut app = DesignApp::new(session, services());
+            let clipboard = std::sync::Arc::new(NativeClipboard {
+                adapter: std::sync::Mutex::new(egui_winit::clipboard::Clipboard::new(cc.display_handle().ok().map(|handle| handle.as_raw()))),
+                _window: cc.winit_window().cloned(),
+            });
+            let copy_clipboard = std::sync::Arc::clone(&clipboard);
+            cc.egui_ctx.add_plugin(NativeClipboardOutput(move |text: &str| {
+                copy_clipboard.adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_text(text.to_owned());
+            }));
+            let (paste_tx, paste_requests) = std::sync::mpsc::channel::<PasteRequest>();
+            let paste_ctx = cc.egui_ctx.clone();
+            let mut platform_services = services();
+            platform_services.request_paste = Some(Box::new(move |request| {
+                let _ = paste_tx.send(request);
+                paste_ctx.request_repaint();
+            }));
+            let mut app = DesignApp::new(session, platform_services);
             if let Some(line) = gpu.as_ref().and_then(gpu::Startup::status_line) {
                 app.status(line);
             }
@@ -330,6 +387,9 @@ fn main() -> eframe::Result {
             }
             Ok(Box::new(App {
                 app,
+                clipboard,
+                paste_requests,
+                paste_completions: Vec::new(),
                 #[cfg(target_os = "macos")]
                 menu: None,
                 startup: gpu,
@@ -364,5 +424,81 @@ mod tests {
         assert!(place.iter().any(|filter| filter.extensions.contains(&"png")));
         let documents = super::open_filters("");
         assert!(documents.iter().any(|filter| filter.extensions.contains(&"designcraft")));
+    }
+}
+
+#[cfg(test)]
+mod native_clipboard_output_tests {
+    use super::NativeClipboardOutput;
+    use std::sync::{Arc, Mutex};
+
+    struct LateCopy(Option<String>);
+    impl egui::Plugin for LateCopy {
+        fn debug_name(&self) -> &'static str {
+            "Late copy regression"
+        }
+        fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+            if let Some(text) = self.0.take() {
+                ui.ctx().copy_text(text);
+            }
+        }
+    }
+
+    #[test]
+    fn copies_late_text_at_output_handoff_without_consuming_backend_commands() {
+        for late in ["selected label", ""] {
+            let ctx = egui::Context::default();
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&writes);
+            ctx.add_plugin(NativeClipboardOutput(move |text: &str| sink.lock().unwrap().push(text.to_owned())));
+            ctx.add_plugin(LateCopy(Some(late.into())));
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.ctx().copy_text("earlier field".into());
+                assert!(writes.lock().unwrap().is_empty(), "copy must wait for completed output");
+            });
+            assert_eq!(*writes.lock().unwrap(), [late]);
+            let texts: Vec<_> = output
+                .platform_output
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(texts, ["earlier field", late]);
+            output.drop_without_applying_deltas();
+            // A later external value must not be replaced on a frame with no copy.
+            *writes.lock().unwrap() = vec!["external replacement".into()];
+            ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+            assert_eq!(*writes.lock().unwrap(), ["external replacement"]);
+        }
+    }
+
+    #[test]
+    fn final_pass_copy_wins_when_an_earlier_pass_is_discarded() {
+        let ctx = egui::Context::default();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&writes);
+        ctx.add_plugin(NativeClipboardOutput(move |text: &str| sink.lock().unwrap().push(text.to_owned())));
+        ctx.add_plugin(LateCopy(Some("late first pass".into())));
+        let mut passes = 0;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            passes += 1;
+            if passes == 1 {
+                ui.ctx().copy_text("early first pass".into());
+                ui.ctx().request_discard("clipboard ordering regression");
+            } else {
+                ui.ctx().copy_text("final pass".into());
+            }
+        });
+        assert_eq!(passes, 2);
+        assert_eq!(*writes.lock().unwrap(), ["late first pass", "final pass"]);
+        let last = output.platform_output.commands.iter().rev().find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(last, Some("final pass"));
+        output.drop_without_applying_deltas();
     }
 }

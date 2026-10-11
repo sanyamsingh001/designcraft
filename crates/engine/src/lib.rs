@@ -256,6 +256,10 @@ pub struct Session {
     pub recovery_dir: Option<std::path::PathBuf>,
     /// Copied text with its formatting (a frameless story slice) and its plain text.
     pub text_clipboard: Option<(Arc<designcraft_doc::Story>, String)>,
+    /// Exact system text emitted for the current object clipboard; never document state.
+    pub(crate) object_clipboard_marker: Option<String>,
+    /// Random namespace for object ownership, initialized before the first successful Copy/Cut.
+    pub(crate) object_clipboard_nonce: Option<[u8; 16]>,
     /// Requests for the UI (dialogs, view changes) produced by tools/commands.
     pub ui_requests: Vec<UiRequest>,
     /// Graphic loaded in the place cursor: (asset, natural size in points).
@@ -294,6 +298,8 @@ impl Session {
             clipboard: None,
             recovery_dir: None,
             text_clipboard: None,
+            object_clipboard_marker: None,
+            object_clipboard_nonce: None,
             ui_requests: vec![],
             loaded: None,
             transforms: Default::default(),
@@ -546,6 +552,8 @@ fn push_undo(st: &mut DocState, e: HistoryEntry) {
 
 pub(crate) use push_undo as record_undo;
 
+#[cfg(test)]
+mod reflow_review8_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

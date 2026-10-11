@@ -1462,11 +1462,7 @@ fn handle_input(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, r
             }
             egui::Event::Copy | egui::Event::Cut if wants_text => {
                 let id = if matches!(e, egui::Event::Cut) { "edit.cut" } else { "edit.copy" };
-                if let Ok(r) = app.run(id, json!({}))
-                    && let Some(t) = r.get("text").and_then(serde_json::Value::as_str)
-                {
-                    ui.ctx().copy_text(t.to_string());
-                }
+                let _ = app.run(id, json!({}));
             }
             egui::Event::Key { key, pressed: true, modifiers, .. } => {
                 let k = match key {
@@ -1806,3 +1802,7 @@ mod tests {
         assert!(h.query_by_label("   Points").is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "clipboard_menu_paste_tests.rs"]
+mod clipboard_menu_paste_tests;

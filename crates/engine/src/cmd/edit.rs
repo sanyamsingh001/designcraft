@@ -39,6 +39,10 @@ fn plain(st: &designcraft_doc::Story) -> String {
     st.text.chars().filter(|c| !('\u{E000}'..='\u{E1FF}').contains(c)).map(|c| if c == '\u{2028}' { '\n' } else { c }).collect()
 }
 
+fn normalized_clipboard_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Copy the selected text with its formatting. Returns its plain text (for the system clipboard).
 fn copy_text(s: &mut Session) -> Result<Option<String>> {
     let st = s.doc()?;
@@ -47,6 +51,7 @@ fn copy_text(s: &mut Session) -> Result<Option<String>> {
     let slice = story.extract(t.range());
     let text = plain(&slice);
     s.text_clipboard = Some((Arc::new(slice), text.clone()));
+    s.object_clipboard_marker = None;
     Ok(Some(text))
 }
 
@@ -55,9 +60,13 @@ fn copy_text(s: &mut Session) -> Result<Option<String>> {
 fn paste_text(s: &mut Session, text: Option<String>, formatted: bool) -> Result<Value> {
     let t = s.doc()?.selection.text.ok_or_else(|| super::bad("edit.paste", "no insertion point"))?;
     let clip = s.text_clipboard.clone();
-    // Items copied last (no text copied since) paste into the text as anchored objects.
+    // The shared UI writes this exact marker on object Copy/Cut. A different supplied
+    // string is external text; no-payload commands retain the internal object clipboard.
+    let object_marker = text.as_ref().is_some_and(|text| Some(text) == s.object_clipboard_marker.as_ref());
+    let object_payload = text.is_none() || object_marker;
     if formatted
         && clip.is_none()
+        && object_payload
         && t.cell.is_none()
         && let Some(items) = s.clipboard.clone()
     {
@@ -72,6 +81,11 @@ fn paste_text(s: &mut Session, text: Option<String>, formatted: bool) -> Result<
                 Ok(json!({"pos": end, "anchored": list.len()}))
             });
         }
+    }
+    // A protocol marker has no plain-text representation. Ineligible objects, plain
+    // paste and child targets must reject it before deleting a selection or inserting text.
+    if object_marker {
+        return Err(super::bad("edit.paste", "object clipboard cannot be pasted as text here"));
     }
     let use_clip = formatted && clip.as_ref().is_some_and(|(_, p)| text.as_ref().is_none_or(|x| x.replace("\r\n", "\n") == *p));
     // Footnotes, cross-references and tables only paste into story text, not cells or footnotes.
@@ -88,7 +102,45 @@ fn paste_text(s: &mut Session, text: Option<String>, formatted: bool) -> Result<
         });
     }
     let text = text.or_else(|| clip.map(|(_, p)| p)).ok_or_else(|| super::bad("edit.paste", "clipboard is empty"))?;
-    s.execute("text.insert", &json!({"text": text.replace("\r\n", "\n").replace('\r', "\n"), "raw": true}))
+    // Reuse the text command's insertion policy without dispatching a second user edit.
+    // Paste owns the history/journal entry and its one post-edit reflow/caption refresh.
+    let insert = super::find_command("text.insert").ok_or_else(|| super::bad("edit.paste", "text insertion command is unavailable"))?;
+    (insert.run)(s, &json!({"text": normalized_clipboard_text(&text), "raw": true}))
+}
+
+/// Publish object ownership only after Copy/Cut succeeds. Keep Cut's existing result fields.
+fn copy_objects(s: &mut Session, cut: Option<&Value>) -> Result<Value> {
+    copy_objects_with_entropy(s, cut, getrandom::fill)
+}
+
+fn copy_objects_with_entropy(
+    s: &mut Session,
+    cut: Option<&Value>,
+    fill: impl FnOnce(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
+) -> Result<Value> {
+    let clipboard = Arc::new(clip_doc(s)?);
+    // Acquire fallible instance identity before Cut can remove any document content.
+    let nonce = if let Some(nonce) = s.object_clipboard_nonce {
+        nonce
+    } else {
+        let mut nonce = [0; 16];
+        let command = if cut.is_some() { "edit.cut" } else { "edit.copy" };
+        fill(&mut nonce).map_err(|error| super::bad(command, format!("clipboard identity unavailable: {error}")))?;
+        nonce
+    };
+    let id = crate::NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let marker = format!("DesignCraft object clipboard {:032x}:{id}", u128::from_be_bytes(nonce));
+    let mut result = if let Some(params) = cut { clear(s, params)? } else { Value::Null };
+    if result.is_null() {
+        result = json!({});
+    }
+    let fields = result.as_object_mut().ok_or_else(|| super::bad("edit.copy", "invalid clipboard result"))?;
+    fields.insert("clipboardText".to_string(), json!(marker));
+    s.clipboard = Some(clipboard);
+    s.object_clipboard_nonce = Some(nonce);
+    s.object_clipboard_marker = Some(marker);
+    s.text_clipboard = None;
+    Ok(result)
 }
 
 fn strip_objects(st: &designcraft_doc::Story) -> designcraft_doc::Story {
@@ -99,6 +151,21 @@ fn strip_objects(st: &designcraft_doc::Story) -> designcraft_doc::Story {
         out.delete(i..i + n);
     }
     out
+}
+
+/// Apply removal inside the owning command, so Cut and Clear each record one history entry.
+fn clear(s: &mut Session, p: &Value) -> Result<Value> {
+    if s.doc()?.selection.text.is_some() && p.get("ids").is_none() {
+        return super::text::delete_selection(s);
+    }
+    let ids = super::targets(s, p)?;
+    s.edit(|d, sel| {
+        for id in &ids {
+            let _ = d.remove_item(*id);
+        }
+        *sel = Selection::default();
+        Ok(json!({"deleted": ids.len()}))
+    })
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -184,35 +251,28 @@ pub fn specs() -> Vec<CommandSpec> {
             st.revision += 1;
             ok()
         }),
-        cmd!("edit.clear", "Clear", ["Edit"], Some("Delete"), "{ids?} — delete selected items (or the selected text)", has_doc, |s, p| {
-            if s.doc()?.selection.text.is_some() && p.get("ids").is_none() {
-                return super::text::delete_selection(s);
+        cmd!("edit.clear", "Clear", ["Edit"], Some("Delete"), "{ids?} — delete selected items (or the selected text)", has_doc, clear),
+        cmd!(noundo "edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{} → {text} for selected text (with formatting), {clipboardText} for copied objects", has_selection_or_text, |s, _| {
+            if let Some(text) = copy_text(s)? {
+                return Ok(json!({"text": text}));
             }
-            let ids = super::targets(s, p)?;
-            s.edit(|d, sel| {
-                for id in &ids {
-                    let _ = d.remove_item(*id);
+            copy_objects(s, None)
+        }),
+        cmd!(
+            "edit.cut",
+            "Cut",
+            ["Edit"],
+            Some("Cmd+X"),
+            "{} → {text} for selected text, {deleted, clipboardText} for cut objects",
+            has_selection_or_text,
+            |s, p| {
+                if let Some(text) = copy_text(s)? {
+                    super::text::delete_selection(s)?;
+                    return Ok(json!({"text": text}));
                 }
-                *sel = Selection::default();
-                Ok(json!({"deleted": ids.len()}))
-            })
-        }),
-        cmd!(noundo "edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{} → {text} when text is selected (with formatting, footnotes, markers)", has_selection_or_text, |s, _| {
-            if let Some(text) = copy_text(s)? {
-                return Ok(json!({"text": text}));
+                copy_objects(s, Some(p))
             }
-            s.clipboard = Some(Arc::new(clip_doc(s)?));
-            s.text_clipboard = None;
-            ok()
-        }),
-        cmd!("edit.cut", "Cut", ["Edit"], Some("Cmd+X"), "{}", has_selection_or_text, |s, p| {
-            if let Some(text) = copy_text(s)? {
-                super::text::delete_selection(s)?;
-                return Ok(json!({"text": text}));
-            }
-            s.clipboard = Some(Arc::new(clip_doc(s)?));
-            s.execute("edit.clear", p)
-        }),
+        ),
         cmd!(
             "edit.pasteWithoutFormatting",
             "Paste without Formatting",
@@ -455,3 +515,19 @@ mod paste_into_tests {
         s.doc().unwrap().doc.check().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "edit_review15_tests.rs"]
+mod review15_external_paste_tests;
+
+#[cfg(test)]
+#[path = "edit_review16_tests.rs"]
+mod review16_clipboard_tests;
+
+#[cfg(test)]
+#[path = "edit_clipboard_identity_tests.rs"]
+mod clipboard_identity_tests;
+
+#[cfg(test)]
+#[path = "edit_clipboard_entropy_tests.rs"]
+mod clipboard_entropy_tests;

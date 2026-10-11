@@ -22,6 +22,8 @@ designcraft-textimport = { workspace = true }
 designcraft-pdf = { workspace = true }
 designcraft-tools = { workspace = true }
 designcraft-idml = { workspace = true }
+# Existing locked provider; wasm_js selects the supported browser backend.
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

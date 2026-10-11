@@ -49,6 +49,15 @@ pub struct ImportedFile {
     pub name: String,
     pub bytes: Vec<u8>,
 }
+/// The document and text selection that requested an asynchronous menu Paste.
+/// Hosts return this opaque context with the clipboard text; stale requests are cancelled.
+pub struct PasteRequest {
+    target: u64,
+    document: std::sync::Arc<designcraft_doc::Document>,
+    selection: designcraft_doc::Selection,
+    story_editor: Option<designcraft_doc::StoryId>,
+}
+
 pub type OpenAsyncFn = Box<dyn FnMut(ImportRequest)>;
 pub type DownloadFn = Box<dyn FnMut(&str, &[u8])>;
 /// Files delivered asynchronously with their original operation and document identity.
@@ -71,6 +80,9 @@ pub struct Services {
     pub download: Option<DownloadFn>,
     /// Files delivered asynchronously, drained every frame with their captured request context.
     pub inbox: Option<Inbox>,
+    /// Read the host clipboard and return its text through [`DesignApp::receive_clipboard_paste`].
+    /// Without a host reader, use the native integration's `RequestPaste` command.
+    pub request_paste: Option<Box<dyn FnMut(PasteRequest)>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +477,10 @@ pub struct DesignApp {
     pub color_applied: bool,
     pub perf: Perf,
     pub synthetic: Vec<egui::Event>,
+    /// Latest successful Copy/Cut output, delivered through the shared egui frame.
+    pending_clipboard_text: Option<String>,
+    /// A user menu Paste waits for the integration to return an actual clipboard payload.
+    pending_clipboard_paste: Option<PasteRequest>,
     /// Story open in the Story Editor.
     pub story_editor: Option<designcraft_doc::StoryId>,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -507,6 +523,8 @@ impl DesignApp {
             color_applied: false,
             perf: Perf::default(),
             synthetic: vec![],
+            pending_clipboard_text: None,
+            pending_clipboard_paste: None,
             story_editor: None,
             control_rx: None,
             pending_shots: vec![],
@@ -566,10 +584,67 @@ impl DesignApp {
         }
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
         self.after_engine();
+        if matches!(id, "edit.copy" | "edit.cut")
+            && let Ok(result) = &r
+            && let Some(text) = result.get("clipboardText").and_then(Value::as_str).or_else(|| result.get("text").and_then(Value::as_str))
+        {
+            self.pending_clipboard_text = Some(text.to_string());
+        }
         if let Err(e) = &r {
             self.status(e.clone());
         }
         r
+    }
+
+    fn queue_clipboard_paste(&mut self) {
+        self.pending_clipboard_paste = self.session.active().map(|state| PasteRequest {
+            target: state.uid,
+            document: state.doc.clone(),
+            selection: state.selection.clone(),
+            story_editor: self.story_editor,
+        });
+    }
+
+    fn paste_target_matches(&mut self, ctx: &egui::Context, request: &PasteRequest) -> bool {
+        self.session.wants_text()
+            && !ctx.text_edit_focused()
+            && self.ui.dialog.is_none()
+            && self.story_editor == request.story_editor
+            && self.session.active().is_some_and(|state| {
+                state.uid == request.target && std::sync::Arc::ptr_eq(&state.doc, &request.document) && state.selection == request.selection
+            })
+    }
+
+    /// Complete a host clipboard read only while its original editing context is current.
+    /// Apply immediately so later input cannot route a delayed paste event to another target.
+    pub fn receive_clipboard_paste(&mut self, ctx: &egui::Context, request: PasteRequest, text: String) -> bool {
+        self.paste_target_matches(ctx, &request) && self.run("edit.paste", json!({"text": text})).is_ok()
+    }
+
+    // Called only at frame start, before publishing any queued Copy/Cut. A menu request
+    // made during a frame is read on the next frame, after that frame's writes were delivered.
+    fn flush_clipboard_request(&mut self, ctx: &egui::Context) {
+        if self.pending_clipboard_text.is_none()
+            && let Some(request) = self.pending_clipboard_paste.take()
+        {
+            if !self.paste_target_matches(ctx, &request) {
+                return;
+            }
+            if let Some(request_paste) = &mut self.services.request_paste {
+                request_paste(request);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
+        }
+    }
+
+    fn flush_clipboard_output(&mut self, ctx: &egui::Context) {
+        if let Some(text) = self.pending_clipboard_text.take() {
+            ctx.copy_text(text);
+        }
+        if self.pending_clipboard_paste.is_some() {
+            ctx.request_repaint();
+        }
     }
 
     /// Handle requests produced by tools/commands (dialogs, view changes, file pickers).
@@ -817,6 +892,8 @@ impl DesignApp {
     /// Lay out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.flush_clipboard_request(&ctx);
+        self.flush_clipboard_output(&ctx);
         if !self.fonts_ready {
             ctx.request_repaint();
             return;
@@ -932,6 +1009,7 @@ impl DesignApp {
         dialogs::show(self, &ctx);
         about::show(self, &ctx);
         menus::palette(self, &ctx);
+        self.flush_clipboard_output(&ctx);
         for url in std::mem::take(&mut self.ui.pending_urls) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
@@ -1589,3 +1667,6 @@ mod browser_import_tests {
         assert!(app.session.doc().unwrap().doc.assets.is_empty());
     }
 }
+
+#[cfg(test)]
+mod clipboard_output_review16_tests;

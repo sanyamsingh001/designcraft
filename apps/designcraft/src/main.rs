@@ -46,6 +46,22 @@ impl<F: FnMut(&str) + Send + Sync + 'static> egui::Plugin for NativeClipboardOut
     }
 }
 
+fn clipboard_paste_completion(request: PasteRequest, text: Option<String>) -> Option<(PasteRequest, String)> {
+    text.map(|text| (request, text.replace("\r\n", "\n")))
+}
+
+fn ui_with_clipboard_paste(app: &mut DesignApp, ui: &mut egui::Ui, completions: &mut Vec<(PasteRequest, String)>) {
+    app.ui(ui);
+    // Input can replace the rich clipboard without changing the document or selection.
+    for (request, text) in completions.drain(..) {
+        if text.is_empty() && !app.session.has_usable_empty_text_clipboard() {
+            continue;
+        }
+        app.receive_clipboard_paste(ui.ctx(), request, text);
+        ui.ctx().request_repaint();
+    }
+}
+
 struct App {
     app: DesignApp,
     clipboard: std::sync::Arc<NativeClipboard>,
@@ -86,19 +102,14 @@ impl eframe::App for App {
         // clipboard output. Keyboard Paste remains ordinary input.
         while let Ok(request) = self.paste_requests.try_recv() {
             let text = self.clipboard.adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get();
-            if let Some(text) = text.filter(|text| !text.is_empty()) {
-                self.paste_completions.push((request, text.replace("\r\n", "\n")));
+            if let Some(completion) = clipboard_paste_completion(request, text) {
+                self.paste_completions.push(completion);
             }
         }
         self.app.raw_input_hook(raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.app.ui(ui);
-        // Process current keyboard/canvas input before checking the captured target.
-        for (request, text) in self.paste_completions.drain(..) {
-            self.app.receive_clipboard_paste(ui.ctx(), request, text);
-            ui.ctx().request_repaint();
-        }
+        ui_with_clipboard_paste(&mut self.app, ui, &mut self.paste_completions);
     }
     fn on_exit(&mut self) {
         // A normal exit before the third frame is not a crash.
@@ -500,5 +511,255 @@ mod native_clipboard_output_tests {
         });
         assert_eq!(last, Some("final pass"));
         output.drop_without_applying_deltas();
+    }
+}
+
+#[cfg(test)]
+mod native_clipboard_paste_tests {
+    use super::{DesignApp, PasteRequest, Services, Session, clipboard_paste_completion, ui_with_clipboard_paste};
+    use designcraft_engine::DocState;
+    use egui::{Context, Event, RawInput};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, mpsc};
+
+    fn frame(app: &mut DesignApp, ctx: &Context, events: Vec<Event>, completions: &mut Vec<(PasteRequest, String)>) {
+        let mut raw = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+            max_texture_side: Some(8192),
+            time: Some(ctx.input(|i| i.time) + 1.0 / 60.0),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        app.raw_input_hook(&mut raw);
+        ctx.run_ui(raw, |ui| {
+            app.logic(ui.ctx());
+            ui_with_clipboard_paste(app, ui, completions);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.ui.status.is_empty(), "{}", app.ui.status);
+    }
+
+    fn seed_redo(app: &mut DesignApp) {
+        let doc = app.session.doc().unwrap().doc.clone();
+        let selection = app.session.doc().unwrap().selection.clone();
+        app.run("text.insert", json!({"text": "temporary"})).unwrap();
+        app.run("edit.undo", json!({})).unwrap();
+        assert!(Arc::ptr_eq(&app.session.doc().unwrap().doc, &doc), "Undo must restore the fixture document");
+        // Undo restores the recorded post-command caret; restore the test target explicitly.
+        app.session.doc_mut().unwrap().selection = selection.clone();
+        assert_eq!(app.session.doc().unwrap().selection, selection);
+        assert!(!app.session.doc().unwrap().history.redo.is_empty());
+    }
+
+    fn fixture(copy: &str) -> (DesignApp, Context) {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let source = app.run("frame.create", json!({"rect": [36,36,300,300], "content": "text", "text": ""})).unwrap();
+        app.run("text.select", json!({"story": source["story"], "anchor": 0, "focus": 0})).unwrap();
+        app.run("footnote.insert", json!({"text": "retained note"})).unwrap();
+        app.run("text.select", json!({"story": source["story"], "anchor": 0, "focus": 3})).unwrap();
+        app.run("type.char", json!({"attrs": {"tracking": 75}})).unwrap();
+        assert_eq!(app.run(copy, json!({})).unwrap()["text"], "");
+        let (slice, plain) = app.session.text_clipboard.as_ref().unwrap();
+        assert_eq!(slice.text, "\u{E00A}");
+        assert!(plain.is_empty());
+        assert_eq!(slice.notes[0].text.text, "retained note");
+        let target = app.run("frame.create", json!({"rect": [320,36,560,300], "content": "text", "text": "OLD"})).unwrap();
+        app.run("text.select", json!({"story": target["story"], "anchor": 1, "focus": 2})).unwrap();
+        app.session.set_tool("type");
+        app.view_mut().unwrap();
+        seed_redo(&mut app);
+        let ctx = Context::default();
+        for _ in 0..6 {
+            frame(&mut app, &ctx, vec![], &mut Vec::new());
+        }
+        assert!(app.canvas_rect.is_some(), "full shared UI must have finished font setup");
+        assert!(app.session.wants_text() && !ctx.text_edit_focused());
+        assert!(app.session.has_usable_empty_text_clipboard());
+        (app, ctx)
+    }
+
+    fn request(app: &mut DesignApp, ctx: &Context) -> PasteRequest {
+        let (tx, rx) = mpsc::channel();
+        app.services.request_paste = Some(Box::new(move |request| tx.send(request).unwrap()));
+        designcraft_ui_egui::menus::activate(app, "edit.paste", &Value::Null);
+        // A pending Copy may require its output pass before the request is issued.
+        for _ in 0..2 {
+            frame(app, ctx, vec![], &mut Vec::new());
+        }
+        let request = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err());
+        request
+    }
+
+    fn assert_conserved(app: &DesignApp, before: &DocState, journal: &[(String, Value)]) {
+        let after = app.session.doc().unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &after.doc));
+        assert_eq!(*after.doc, *before.doc);
+        assert_eq!(after.selection, before.selection);
+        assert_eq!(after.revision, before.revision);
+        for (old, new) in [(&before.history.undo, &after.history.undo), (&before.history.redo, &after.history.redo)] {
+            assert_eq!(old.len(), new.len());
+            for (old, new) in old.iter().zip(new) {
+                assert_eq!(old.label, new.label);
+                assert_eq!(old.selection, new.selection);
+                assert!(Arc::ptr_eq(&old.doc, &new.doc));
+            }
+        }
+        assert_eq!(app.session.journal, journal);
+    }
+
+    #[test]
+    fn native_empty_note_copy_and_cut_paste_one_edit_with_undo_redo() {
+        for copy in ["edit.copy", "edit.cut"] {
+            let (mut app, ctx) = fixture(copy);
+            let request = request(&mut app, &ctx);
+            let before = app.session.doc().unwrap().clone();
+            let target = before.selection.text.unwrap();
+            let journal = app.session.journal.len();
+            let mut completed: Vec<_> = clipboard_paste_completion(request, Some(String::new())).into_iter().collect();
+            assert_eq!(completed.len(), 1, "successful empty reads must reach delivery");
+            frame(&mut app, &ctx, vec![], &mut completed);
+            assert!(completed.is_empty());
+            let after = app.session.doc().unwrap().clone();
+            let story = after.doc.story(target.story).unwrap();
+            assert_eq!(story.text, "O\u{E00A}D");
+            assert_eq!(story.notes.len(), 1);
+            assert_eq!(story.notes[0].text.text, "retained note");
+            assert_eq!(story.format_after(1).over.tracking, Some(75.0));
+            assert!(story.objects.is_empty());
+            assert_eq!(after.selection.text.unwrap().range(), 4..4);
+            assert_eq!(after.history.undo.len(), before.history.undo.len() + 1);
+            assert!(after.history.redo.is_empty());
+            assert_eq!(app.session.journal.len(), journal + 1);
+            assert_eq!(app.session.journal.last().unwrap(), &("edit.paste".into(), json!({"text": ""})));
+            assert_eq!(after.doc.assets, before.doc.assets);
+            for (id, story) in &before.doc.stories {
+                if *id != target.story {
+                    assert_eq!(after.doc.story(*id).unwrap(), story.as_ref());
+                }
+            }
+            after.doc.check().unwrap();
+            app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(*app.session.doc().unwrap().doc, *before.doc);
+            app.run("edit.redo", json!({})).unwrap();
+            assert_eq!(*app.session.doc().unwrap().doc, *after.doc);
+        }
+    }
+
+    #[test]
+    fn native_external_empty_without_usable_rich_content_preserves_selected_range() {
+        for clipboard in ["none", "plain", "objects"] {
+            let (mut app, ctx) = fixture("edit.copy");
+            let target = app.session.doc().unwrap().selection.text.unwrap();
+            match clipboard {
+                "none" => app.session.text_clipboard = None,
+                "plain" => {
+                    assert_eq!(app.run("edit.copy", json!({})).unwrap()["text"], "L");
+                }
+                _ => {
+                    assert_eq!(clipboard, "objects");
+                    let item = app.run("frame.create", json!({"rect": [100,100,140,140], "content": "unassigned"})).unwrap();
+                    app.run("selection.set", json!({"ids": [item["id"]]})).unwrap();
+                    assert!(!app.run("edit.copy", json!({})).unwrap()["clipboardText"].as_str().unwrap().is_empty());
+                    app.run("text.select", json!({"story": target.story.0, "anchor": 1, "focus": 2})).unwrap();
+                }
+            }
+            seed_redo(&mut app);
+            let request = request(&mut app, &ctx);
+            assert!(!app.session.has_usable_empty_text_clipboard());
+            let before = app.session.doc().unwrap().clone();
+            let journal = app.session.journal.clone();
+            let mut completed: Vec<_> = clipboard_paste_completion(request, Some(String::new())).into_iter().collect();
+            assert_eq!(completed.len(), 1);
+            frame(&mut app, &ctx, vec![], &mut completed);
+            assert!(completed.is_empty());
+            assert_conserved(&app, &before, &journal);
+        }
+    }
+
+    #[test]
+    fn native_empty_footnote_slice_cannot_delete_cell_or_footnote_text() {
+        for note in [false, true] {
+            let (mut app, ctx) = fixture("edit.copy");
+            let target = app.session.doc().unwrap().selection.text.unwrap();
+            app.run("text.select", json!({"story": target.story.0, "anchor": 3, "focus": 3})).unwrap();
+            if note {
+                app.run("footnote.insert", json!({"text": "CHILD"})).unwrap();
+            } else {
+                app.run("table.insert", json!({"rows": 1, "cols": 1, "width": 160})).unwrap();
+                app.run("text.insert", json!({"text": "CHILD", "raw": true})).unwrap();
+            }
+            app.run("text.move", json!({"dir": "storyStart"})).unwrap();
+            app.run("text.move", json!({"dir": "storyEnd", "extend": true})).unwrap();
+            assert_eq!(app.session.doc().unwrap().selection.text.unwrap().range(), 0..5);
+            assert!(app.session.doc().unwrap().selection.text.unwrap().cell.is_some());
+            seed_redo(&mut app);
+            let request = request(&mut app, &ctx);
+            assert!(!app.session.has_usable_empty_text_clipboard());
+            let before = app.session.doc().unwrap().clone();
+            let journal = app.session.journal.clone();
+            let mut completed: Vec<_> = clipboard_paste_completion(request, Some(String::new())).into_iter().collect();
+            frame(&mut app, &ctx, vec![], &mut completed);
+            assert!(completed.is_empty());
+            assert_conserved(&app, &before, &journal);
+        }
+    }
+
+    #[test]
+    fn native_empty_eligibility_is_rechecked_after_current_ui_copy() {
+        let (mut app, ctx) = fixture("edit.copy");
+        let request = request(&mut app, &ctx);
+        let before = app.session.doc().unwrap().clone();
+        assert_eq!(before.selection.text.unwrap().range(), 1..2);
+        let mut journal = app.session.journal.clone();
+        let mut completed: Vec<_> = clipboard_paste_completion(request, Some(String::new())).into_iter().collect();
+        assert!(app.session.has_usable_empty_text_clipboard(), "eligible when the read completed");
+        frame(&mut app, &ctx, vec![Event::Copy], &mut completed);
+        assert!(completed.is_empty());
+        assert_eq!(app.session.text_clipboard.as_ref().unwrap().1, "L", "current UI Copy must actually run");
+        assert!(!app.session.has_usable_empty_text_clipboard());
+        journal.push(("edit.copy".into(), json!({})));
+        assert_conserved(&app, &before, &journal);
+    }
+
+    #[test]
+    fn native_unavailable_read_and_stale_empty_completion_preserve_state() {
+        for unavailable in [true, false] {
+            let (mut app, ctx) = fixture("edit.copy");
+            let request = request(&mut app, &ctx);
+            let captured = app.session.doc().unwrap().doc.clone();
+            let mut completed: Vec<_> =
+                clipboard_paste_completion(request, if unavailable { None } else { Some(String::new()) }).into_iter().collect();
+            assert_eq!(completed.len(), usize::from(!unavailable));
+            if !unavailable {
+                let target = app.session.doc().unwrap().selection.text.unwrap();
+                app.run("text.insert", json!({"text": "changed"})).unwrap();
+                app.run("text.select", json!({"story": target.story.0, "anchor": target.anchor, "focus": target.focus})).unwrap();
+                assert!(!Arc::ptr_eq(&captured, &app.session.doc().unwrap().doc), "the document changed despite restored selection");
+            }
+            assert!(app.session.has_usable_empty_text_clipboard(), "payload eligibility must not bypass the tagged guard");
+            let before = app.session.doc().unwrap().clone();
+            let journal = app.session.journal.clone();
+            frame(&mut app, &ctx, vec![], &mut completed);
+            assert!(completed.is_empty());
+            assert_conserved(&app, &before, &journal);
+        }
+    }
+
+    #[test]
+    fn native_nonempty_read_keeps_normalization_and_plain_paste() {
+        let (mut app, ctx) = fixture("edit.copy");
+        let request = request(&mut app, &ctx);
+        let before = app.session.doc().unwrap().clone();
+        let target = before.selection.text.unwrap();
+        let mut completed: Vec<_> = clipboard_paste_completion(request, Some("external\r\ntext".into())).into_iter().collect();
+        assert_eq!(completed[0].1, "external\ntext");
+        frame(&mut app, &ctx, vec![], &mut completed);
+        assert_eq!(app.session.doc().unwrap().doc.story(target.story).unwrap().text, "Oexternal\ntextD");
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), before.history.undo.len() + 1);
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(*app.session.doc().unwrap().doc, *before.doc);
     }
 }

@@ -109,13 +109,13 @@ fn strip(story: &mut Story) {
 /// A frame a column, frame or page break ends early is left out: it says nothing about how much
 /// a frame holds.
 fn fit(d: &Document, sid: StoryId) -> (Option<usize>, usize, usize) {
-    let cs = designcraft_compose::compose_story(d, sid, &Default::default());
+    // Fit the same expanded text as rendering, including running headers and anchor pages.
+    let cs = designcraft_compose::Cache::new().get(d, sid, None);
     let text = d.story(sid).map_or("", |s| s.text.as_str());
-    let is_break = |c: char| matches!(c, designcraft_doc::COLUMN_BREAK | designcraft_doc::FRAME_BREAK | designcraft_doc::PAGE_BREAK);
     let (mut held, mut full) = (0, 0);
     for f in &cs.frames {
         let Some(shown) = text.get(f.range.clone()) else { continue };
-        if !shown.is_empty() && !shown.chars().any(is_break) {
+        if !shown.is_empty() && !shown.chars().any(designcraft_doc::is_break_char) {
             held += shown.len();
             full += 1;
         }

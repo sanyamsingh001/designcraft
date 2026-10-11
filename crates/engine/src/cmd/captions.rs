@@ -112,6 +112,16 @@ fn caption(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+/// Whether a document spread contains a live caption, including inside groups.
+/// Use the same descendant walk as refresh_live without collecting item ids.
+pub(crate) fn has_live(d: &Document) -> bool {
+    d.spreads.iter().flat_map(|sp| &sp.items).any(|root| {
+        let mut found = false;
+        root.walk(&mut |item| found |= item.live_caption.is_some());
+        found
+    })
+}
+
 /// Bring live captions up to date with their source objects (the text frame's story is
 /// replaced when its text changed; a caption whose source is gone keeps its last text).
 pub(crate) fn refresh_live(d: &mut Document) -> bool {

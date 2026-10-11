@@ -171,6 +171,23 @@ impl Session {
     pub fn commit_interaction(&mut self) -> Result<()> {
         let st = self.doc_mut()?;
         let Some(it) = st.interaction.take() else { return Ok(()) };
+        // Previews defer live captions; update them before reflow and the gesture's undo entry.
+        if crate::cmd::captions::has_live(&st.doc) {
+            let mut d = (*st.doc).clone();
+            if crate::cmd::captions::refresh_live(&mut d) {
+                st.doc = Arc::new(d);
+            }
+        }
+        // Retain the original composition before refreshing child-only reference dependencies.
+        let composition_before =
+            if self.prefs.smart_text_reflow { it.doc.settings.primary_story.map(|sid| self.cache.get(&it.doc, sid, None)) } else { None };
+        self.invalidate_primary_reference_cache(&it.doc);
+        if self.prefs.smart_text_reflow {
+            // Previews defer reflow. Compare the gesture's original semantic inputs with its final
+            // document, even if rendering previews replaced or cleared the cache entry.
+            self.smart_reflow(Some(&it.doc), composition_before.as_ref());
+        }
+        let st = self.doc_mut()?;
         if !Arc::ptr_eq(&it.doc, &st.doc) {
             record_undo(st, HistoryEntry { label: it.label, doc: it.doc, selection: it.selection });
         }

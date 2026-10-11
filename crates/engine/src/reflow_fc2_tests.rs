@@ -257,3 +257,133 @@ fn fc2_odd_even_breaks_bound_primary_page_allocation() {
         history(&mut s, sid, &before, &after, count);
     }
 }
+
+// An unused condition definition changes no consumed text, even when it starts hidden.
+fn unused_condition_preserves_explicit_primary_page_removal(visible: bool) {
+    let (mut s, sid) = primary_chain(false);
+    assert!(s.prefs.smart_text_reflow);
+    let removed = remove_tail(&mut s, sid);
+    let before = doc(&s);
+    assert!(before.conditions.is_empty(), "fixture: the primary story has no applied condition");
+    let name = "Unused";
+    let color = [10, 20, 30];
+    let mut expected = (*before).clone();
+    expected.conditions.push(designcraft_doc::Condition { name: name.to_string(), color, visible });
+    let expected = Arc::new(expected);
+    same_composition(&fresh(&before, sid), &fresh(&expected, sid));
+    let count = s.doc().unwrap().history.undo.len();
+    let journal = s.journal.len();
+    s.execute("condition.new", &json!({"name": name, "color": color, "visible": visible})).unwrap();
+    assert_eq!(
+        doc(&s).page_count(),
+        before.page_count(),
+        "an unused condition must not recreate intentionally removed primary pages (visible={visible})"
+    );
+    assert_eq!(s.journal.len(), journal + 1, "one condition edit produces one journal entry");
+    preserved(&mut s, sid, removed, &before, &expected, count);
+}
+
+#[test]
+fn unused_hidden_condition_preserves_explicit_primary_page_removal() {
+    unused_condition_preserves_explicit_primary_page_removal(false);
+}
+
+#[test]
+fn unused_visible_condition_preserves_explicit_primary_page_removal() {
+    unused_condition_preserves_explicit_primary_page_removal(true);
+}
+
+// A used condition in the overset tail must still resume primary growth when its visibility changes.
+#[test]
+fn used_overset_condition_visibility_resumes_primary_growth() {
+    let (mut s, sid) = primary_chain(false);
+    assert!(s.prefs.smart_text_reflow);
+    let name = "Used overset tail";
+    let color = [10, 20, 30];
+    s.execute("condition.new", &json!({"name": name, "color": color, "visible": true})).unwrap();
+    let fitted = doc(&s);
+    let composed = fresh(&fitted, sid);
+    let last = *fitted.story(sid).unwrap().frames.last().unwrap();
+    let range = &composed.frame(last).unwrap().range;
+    assert!(range.end - range.start > 4 * WORDS.len(), "fixture: the last page has room for unconditioned text and a short tail");
+    let end = range.start + 2 * WORDS.len();
+    let tail = "CONDITIONAL TAIL";
+    let start = end + 1;
+    // Shorten the occupied last-page suffix rather than depending on spare capacity for an appended paragraph.
+    s.execute("text.select", &json!({"story": sid.0, "anchor": end, "focus": fitted.story(sid).unwrap().len()})).unwrap();
+    s.execute("text.insert", &json!({"text": format!("\n{tail}")})).unwrap();
+    s.execute("text.select", &json!({"story": sid.0, "anchor": start, "focus": start + tail.len()})).unwrap();
+    s.execute("condition.apply", &json!({"name": name, "only": true})).unwrap();
+    let visible_tail = |cs: &ComposedStory| {
+        cs.frames.iter().flat_map(|f| &f.lines).flat_map(|l| &l.glyphs).any(|g| g.visible && (start..start + tail.len()).contains(&g.byte))
+    };
+    let shown = fresh(&doc(&s), sid);
+    assert!(!shown.is_overset(), "fixture: the used tail fits before removing capacity");
+    assert!(visible_tail(&shown), "fixture: the applied visible condition really draws text");
+    s.execute("condition.options", &json!({"name": name, "visible": false})).unwrap();
+    let hidden = fresh(&doc(&s), sid);
+    assert!(!hidden.is_overset());
+    assert!(!visible_tail(&hidden), "fixture: the same applied condition really hides text");
+
+    let removed = remove_tail(&mut s, sid);
+    let before = doc(&s);
+    let old_story = before.stories.get(&sid).unwrap();
+    let reduced = fresh(&before, sid);
+    assert!(reduced.overset_at.is_some_and(|at| at < end), "fixture: unconditioned text oversets before the separate tail paragraph");
+    let (_, base_chars) = before.styles.resolve_para(&old_story.paras[old_story.para_at(start)]);
+    let props = before.styles.resolve_char(&base_chars, old_story.format_after(start));
+    assert_eq!(props.conditions, vec![name.to_string()], "fixture: exactly this condition controls the tail");
+    assert_eq!(before.conditions, vec![designcraft_doc::Condition { name: name.to_string(), color, visible: false }]);
+    same_composition(&reduced, &s.cache.get(&before, sid, None));
+
+    // Independently specify the definition-only delta; preview is a public-command probe, not the oracle.
+    let mut expected = (*before).clone();
+    expected.conditions[0].visible = true;
+    let params = json!({"name": name, "visible": true});
+    let toggled = probe(&mut s, "condition.options", params.clone());
+    assert_eq!(*toggled, expected, "the toggle itself changes only the condition definition");
+    assert_eq!(full_doc(&toggled), full_doc(&expected));
+    assert!(Arc::ptr_eq(old_story, toggled.stories.get(&sid).unwrap()));
+    assert!(Arc::ptr_eq(&before.styles, &toggled.styles));
+    let still_overset = fresh(&toggled, sid);
+    assert!(still_overset.is_overset(), "revealing the tail cannot create capacity in the reduced chain");
+    same_composition(&reduced, &still_overset);
+
+    let count = s.doc().unwrap().history.undo.len();
+    let journal = s.journal.len();
+    s.execute("condition.options", &params).unwrap();
+    let after = doc(&s);
+    assert!(after.page_count() > before.page_count(), "a used condition toggle must resume primary-page growth");
+    let added = after.page_count() - before.page_count();
+    let old_frames = old_story.frames.len();
+    let new_story = after.story(sid).unwrap();
+    assert_eq!(new_story.frames.len(), old_frames + added);
+    assert_eq!(new_story.rev, old_story.rev + added as u64, "each newly threaded empty frame advances the story revision once");
+    assert_eq!(&new_story.frames[..old_frames], &old_story.frames);
+    assert_eq!(after.spreads.len(), before.spreads.len() + added);
+    assert!(!after.settings.facing_pages);
+    for (sp, frame) in after.spreads[before.spreads.len()..].iter().zip(&new_story.frames[old_frames..]) {
+        assert_eq!(sp.pages.len(), 1);
+        assert_eq!(sp.items.len(), 1);
+        assert_eq!(sp.items[0].id, *frame);
+        assert_eq!(sp.items[0].text_frame().unwrap().story, sid);
+        assert_eq!(sp.items[0].bounds(), sp.pages[0].margin_rect());
+    }
+    assert!(after.next_id > before.next_id);
+    assert_eq!(s.journal.len(), journal + 1);
+    assert!(visible_tail(&fresh(&after, sid)), "the revealed tail must really be composed after growth");
+
+    // Ignore only allocated capacity/ids and the asserted thread revisions; repagination regenerates spread ids.
+    let mut without_growth = (*after).clone();
+    without_growth.spreads.truncate(before.spreads.len());
+    for (sp, old) in without_growth.spreads.iter_mut().zip(&before.spreads) {
+        Arc::make_mut(sp).id = old.id;
+    }
+    let restored_story = Arc::make_mut(without_growth.stories.get_mut(&sid).unwrap());
+    restored_story.frames.truncate(old_frames);
+    restored_story.rev = old_story.rev;
+    without_growth.next_id = before.next_id;
+    assert_eq!(without_growth, expected, "apart from appended capacity/ids/thread revisions, the full Doc changes only visibility");
+    assert_eq!(full_doc(&without_growth), full_doc(&expected));
+    growth(&mut s, sid, Some(removed), &before, count);
+}

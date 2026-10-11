@@ -688,24 +688,28 @@ fn reflow_composite_same(a: &designcraft_doc::Styles, b: &designcraft_doc::Style
 // Walk paragraph/run boundaries together; an unused definition must not resume page generation.
 // Story comparison has already checked matching text, run lengths and child structure.
 fn reflow_formats_same(
-    a: &Arc<designcraft_doc::Styles>,
-    b: &Arc<designcraft_doc::Styles>,
+    before: &Document,
+    after: &Document,
     story: &designcraft_doc::Story,
     current: &designcraft_doc::Story,
     note_style: &str,
     depth: usize,
 ) -> bool {
-    if Arc::ptr_eq(a, b) && std::ptr::eq(story, current) {
+    let (a, b) = (&before.styles, &after.styles);
+    if Arc::ptr_eq(a, b) && std::ptr::eq(story, current) && before.conditions == after.conditions {
         return true;
     }
     if depth >= 64 {
         return false;
     }
+    // Match shaping's all-hidden rule only for formatting used or referenced here.
+    // A condition-bank edit can change visibility while style/story Arcs stay shared.
+    let conditions_same = |chars: &designcraft_doc::CharProps| before.conditions_hide(&chars.conditions) == after.conditions_hide(&chars.conditions);
     let mut runs = story.runs().zip(current.runs()).peekable();
     for ((range, para), current_para) in story.para_ranges().into_iter().zip(&story.paras).zip(&current.paras) {
         let old = a.resolve_para(para);
         let new = b.resolve_para(current_para);
-        if old != new || !reflow_composite_same(a, b, &old.1) {
+        if old != new || !conditions_same(&old.1) || !reflow_composite_same(a, b, &old.1) {
             return false;
         }
         // These rules inject character styles without recording them in the story's runs.
@@ -727,7 +731,7 @@ fn reflow_formats_same(
             }
             let format = designcraft_doc::CharFormat { style: name.into(), ..Default::default() };
             let chars = a.resolve_char(&old.1, &format);
-            if chars != b.resolve_char(&old.1, &format) || !reflow_composite_same(a, b, &chars) {
+            if chars != b.resolve_char(&old.1, &format) || !conditions_same(&chars) || !reflow_composite_same(a, b, &chars) {
                 return false;
             }
         }
@@ -741,7 +745,7 @@ fn reflow_formats_same(
                 return false;
             }
             let chars = a.resolve_char(&old.1, format);
-            if chars != b.resolve_char(&new.1, current_format) || !reflow_composite_same(a, b, &chars) {
+            if chars != b.resolve_char(&new.1, current_format) || !conditions_same(&chars) || !reflow_composite_same(a, b, &chars) {
                 return false;
             }
             if run.end > range.end {
@@ -750,17 +754,14 @@ fn reflow_formats_same(
             runs.next();
         }
     }
-    story
-        .tables
-        .values()
-        .zip(current.tables.values())
-        .all(|(old, new)| old.cells.iter().zip(&new.cells).all(|(old, new)| reflow_formats_same(a, b, &old.text, &new.text, note_style, depth + 1)))
-        && story
-            .notes
-            .iter()
-            .chain(&story.endnotes)
-            .zip(current.notes.iter().chain(&current.endnotes))
-            .all(|(old, new)| reflow_formats_same(a, b, &old.text, &new.text, note_style, depth + 1))
+    story.tables.values().zip(current.tables.values()).all(|(old, new)| {
+        old.cells.iter().zip(&new.cells).all(|(old, new)| reflow_formats_same(before, after, &old.text, &new.text, note_style, depth + 1))
+    }) && story
+        .notes
+        .iter()
+        .chain(&story.endnotes)
+        .zip(current.notes.iter().chain(&current.endnotes))
+        .all(|(old, new)| reflow_formats_same(before, after, &old.text, &new.text, note_style, depth + 1))
 }
 
 // Notes, lists and variable/reference controls also apply entirely in the overset tail.
@@ -870,13 +871,8 @@ fn reflow_inputs_same(a: &Document, b: &Document, sid: designcraft_doc::StoryId,
         || a.settings.glyph_fallback != b.settings.glyph_fallback
         || a.font_scope != b.font_scope
         || a.sections != b.sections
-        || !a.conditions.iter().filter(|condition| !condition.visible).map(|condition| &condition.name).eq(b
-            .conditions
-            .iter()
-            .filter(|condition| !condition.visible)
-            .map(|condition| &condition.name))
         || !reflow_story_same(old, story, 0)
-        || !reflow_formats_same(&a.styles, &b.styles, old, story, &a.footnote_options.ref_char_style, 0)
+        || !reflow_formats_same(a, b, old, story, &a.footnote_options.ref_char_style, 0)
         || !reflow_reference_inputs_same(a, b, old, cache, 0)
     {
         return false;

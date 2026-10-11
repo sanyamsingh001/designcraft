@@ -1350,6 +1350,1585 @@ fn only_english_text_gets_english_hyphenation() {
     assert_eq!(hyphenated(&d2, sid), 0, "French isn't hyphenated with English rules");
 }
 
+// Inspect actual paragraph shaping and the composer's byte-to-glyph mapping without tying
+// language dispatch assertions to the line breaker's choice of line widths.
+fn automatic_hyphenation_glyphs(d: &Document, sid: StoryId) -> (Vec<Glyph>, Vec<bool>) {
+    let story = d.story(sid).unwrap();
+    let (pp, base) = d.styles.resolve_para(&story.paras[0]);
+    let db = FontDb::global().scoped(d.font_scope);
+    let mut styles = Vec::new();
+    let mut missing = HashMap::new();
+    let mut table = shape::StyleTable { styles: &mut styles, missing: &mut missing };
+    let env = shape::TypeEnv { auto_leading: pp.auto_leading, adv: d.settings.advanced_type, glyph_fallback: d.settings.glyph_fallback };
+    let shaped = shape::shape_para(
+        &db,
+        &d.styles,
+        story,
+        0,
+        0..story.text.len(),
+        &base,
+        env,
+        &shape::SubstCtx::default(),
+        &mut table,
+        &pp.nested_styles,
+        &pp.grep_styles,
+        &[],
+    );
+    let points = hyphenation_points(&story.text, &shaped.glyphs, &pp, &d.hyphenation_exception_map());
+    (shaped.glyphs, points)
+}
+
+fn automatic_hyphenation_bytes(d: &Document, sid: StoryId) -> Vec<usize> {
+    let (glyphs, points) = automatic_hyphenation_glyphs(d, sid);
+    points.into_iter().enumerate().filter(|(_, allowed)| *allowed).map(|(i, _)| shape::source_end(&glyphs[..=i])).collect()
+}
+
+// These plain Cyrillic fixtures contain only source glyphs, accents and an inserted hyphen.
+fn assert_hyphenation_cluster_anchors(line: &Line) {
+    let source = if line.hyphenated {
+        let (hyphen, source) = line.glyphs.split_last().unwrap();
+        let end = source.iter().filter(|g| g.len > 0).map(|g| g.byte + g.len).max().unwrap();
+        assert_eq!(hyphen.len, 0);
+        assert_eq!(hyphen.gid, designcraft_fonts::first_glyph(&hyphen.face, &['-', '\u{2010}']));
+        assert_eq!(hyphen.byte, end, "the generated hyphen anchors at the complete source end");
+        source
+    } else {
+        line.glyphs.as_slice()
+    };
+    for g in source.iter().filter(|g| g.len == 0) {
+        assert!(source.iter().any(|base| base.len > 0 && base.byte == g.byte), "an accent glyph left its source cluster");
+    }
+}
+
+#[test]
+fn hyphenation_dispatch_and_word_cache_follow_the_language() {
+    let points = |text: &str, language: &str| {
+        let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 200.0), ParaAttrs::default());
+        d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.language = Some(language.into()));
+        automatic_hyphenation_bytes(&d, sid)
+    };
+    assert_eq!(points("typography", "English: USA"), vec![2, 5, 7]);
+    assert!(points("typography", "Russian").is_empty());
+    assert_eq!(points("typography", "en-US"), vec![2, 5, 7]);
+    assert!(points("типография", "English: USA").is_empty());
+    for language in ["Russian", "$ID/Russian", "ru", "ru_RU"] {
+        assert_eq!(points("типография", language), vec![4, 8, 14], "{language}");
+    }
+    assert!(points("типография", "English: USA").is_empty());
+    for language in ["Spanish", "es", "es_ES"] {
+        assert_eq!(points("transición", language), vec![4, 6], "{language}");
+        assert!(points("transición", "Russian").is_empty());
+        assert_eq!(points("transición", language), vec![4, 6], "cached {language}");
+    }
+    for language in ["French", "uk-UA", "Bulgarian", "[No Language]", "unknown"] {
+        assert!(points("typography", language).is_empty(), "{language}");
+        assert!(points("типография", language).is_empty(), "{language}");
+    }
+}
+
+#[test]
+fn russian_hyphenation_uses_resolved_character_and_automatic_styles() {
+    use designcraft_doc::{CharAttrs, CharacterStyle, GrepStyle, NestedStyle};
+    let text = "типография";
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 200.0), ParaAttrs::default());
+    Arc::make_mut(&mut d.styles).character.push(CharacterStyle {
+        name: "Russian type".into(),
+        based_on: None,
+        chars: CharAttrs { language: Some("Russian".into()), ..Default::default() },
+        shortcut: String::new(),
+    });
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.style = "Russian type".into());
+    assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 8, 14]);
+
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.style = designcraft_doc::story::NO_CHAR_STYLE.into());
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "the default remains English");
+    d.story_mut(sid).unwrap().paras[0].para.grep_styles = Some(vec![GrepStyle { style: "Russian type".into(), pattern: text.into() }]);
+    assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 8, 14]);
+    d.story_mut(sid).unwrap().paras[0].para.grep_styles = None;
+    d.story_mut(sid).unwrap().paras[0].para.nested_styles = Some(vec![NestedStyle { style: "Russian type".into(), ..Default::default() }]);
+    assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 8, 14]);
+}
+
+#[test]
+fn automatic_hyphenation_rejects_language_changes_inside_a_word() {
+    for (text, first, last, split) in [
+        ("typography", "English: USA", "French", 2),
+        ("typography", "French", "English: USA", 2),
+        ("типография", "Russian", "English: USA", 4),
+        ("типография", "Russian", "Ukrainian", 4),
+        ("типография", "[No Language]", "Russian", 4),
+    ] {
+        let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 200.0), ParaAttrs::default());
+        let story = d.story_mut(sid).unwrap();
+        story.format_chars(0..split, |f| f.over.language = Some(first.into()));
+        story.format_chars(split..text.len(), |f| f.over.language = Some(last.into()));
+        assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "{text}: {first} / {last}");
+    }
+}
+
+#[test]
+fn russian_hyphenation_respects_explicit_breaks_exceptions_and_no_break() {
+    let text = "типография";
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 200.0), ParaAttrs::default());
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.language = Some("Russian".into()));
+    assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 8, 14]);
+    d.hyphenation_exceptions = vec!["ти~пография".into()];
+    assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4], "a user exception overrides the patterns");
+    d.hyphenation_exceptions = vec![text.into()];
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "a no-break exception wins over cached points");
+    d.hyphenation_exceptions.clear();
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(true));
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "No Break at the first glyph must also be safe");
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(false));
+    d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(false);
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty());
+    d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(true);
+    d.story_mut(sid).unwrap().paras[0].para.hyph_last_word = Some(false);
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty());
+
+    let text = "типо\u{ad}графия";
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 200.0), ParaAttrs::default());
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.language = Some("Russian".into()));
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "a discretionary hyphen replaces automatic points");
+}
+
+#[test]
+fn russian_hyphenation_reaches_both_composers_at_character_boundaries() {
+    let text = "типография типография типография типография";
+    for composer in [Composer::Paragraph, Composer::SingleLine] {
+        let (mut d, sid, _) =
+            doc_with(text, Rect::new(0.0, 0.0, 38.0, 700.0), ParaAttrs { composer: Some(composer), hyph_zone: Some(0.0), ..Default::default() });
+        d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+            f.over.font_family = Some("Inter".into());
+            f.over.language = Some("Russian".into());
+        });
+        let cs = compose_story(&d, sid, &ComposeOptions::default());
+        assert!(!cs.is_overset(), "{composer:?}");
+        let lines = all_lines(&cs);
+        assert!(lines.iter().any(|l| l.hyphenated), "{composer:?}: Russian words must hyphenate");
+        for line in lines.iter().filter(|l| l.hyphenated) {
+            let last = line.glyphs.iter().rfind(|g| g.len > 0).unwrap();
+            let end = last.byte + last.len;
+            assert!(text.is_char_boundary(end));
+            let start = text[..end].rfind(' ').map_or(0, |p| p + 1);
+            let chars = text[start..end].chars().count();
+            assert!([2, 4, 7].contains(&chars), "{composer:?}: unexpected Russian break after {chars} letters");
+        }
+    }
+}
+
+#[test]
+fn russian_unicode_hyphenation_reaches_source_byte_cluster_boundaries() {
+    for (text, expected) in
+        [("бере\u{0308}за", vec![4, 10]), ("маи\u{0306}ка", vec![8]), ("типо\u{0301}графия", vec![4, 10, 16]), ("помни\u{0301}те", vec![12])]
+    {
+        let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 200.0), ParaAttrs::default());
+        d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+            f.over.font_family = Some("Inter".into());
+            f.over.language = Some("Russian".into());
+        });
+        let points = automatic_hyphenation_bytes(&d, sid);
+        assert_eq!(points, expected, "{text}");
+        let boundaries: Vec<_> = unicode_segmentation::UnicodeSegmentation::grapheme_indices(text, true).map(|(byte, _)| byte).collect();
+        assert!(points.iter().all(|p| boundaries.contains(p)), "{text}: no break between a base and its mark");
+        assert_eq!(d.story(sid).unwrap().text.as_str(), text, "lookup must not normalize the document");
+    }
+}
+
+#[test]
+fn russian_unicode_hyphenation_keeps_explicit_exceptions_language_and_no_break_gates() {
+    let text = "типо\u{0301}графия";
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 200.0), ParaAttrs::default());
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+        f.over.font_family = Some("Inter".into());
+        f.over.language = Some("Russian".into());
+    });
+    assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 10, 16]);
+    d.hyphenation_exceptions = vec!["типо\u{0301}~графия".into()];
+    assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![10], "explicit exceptions retain source scalar indexing");
+    d.hyphenation_exceptions = vec![text.into()];
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "an exact source-word prohibition overrides cached normalized points");
+    d.hyphenation_exceptions.clear();
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(true));
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty());
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(false));
+    d.story_mut(sid).unwrap().format_chars(4..text.len(), |f| f.over.language = Some("French".into()));
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "normalization must not merge language runs");
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.language = Some("English: USA".into()));
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty());
+
+    let text = "типо\u{0301}\u{ad}графия";
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 200.0), ParaAttrs::default());
+    d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.language = Some("Russian".into()));
+    assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "discretionary hyphens still replace automatic breaks");
+}
+
+#[test]
+fn both_composers_keep_russian_decomposition_and_stress_glyphs_with_their_source_cluster() {
+    for (word, expected_ends) in [("тип\u{0301}ография", vec![2, 5, 8]), ("международныи\u{0306}", vec![3, 5, 7, 10])] {
+        let text = [word; 4].join(" ");
+        for composer in [Composer::Paragraph, Composer::SingleLine] {
+            let (mut d, sid, _) =
+                doc_with(&text, Rect::new(0.0, 0.0, 38.0, 700.0), ParaAttrs { composer: Some(composer), hyph_zone: Some(0.0), ..Default::default() });
+            d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+                f.over.font_family = Some("Inter".into());
+                f.over.language = Some("Russian".into());
+            });
+            let cs = compose_story(&d, sid, &ComposeOptions::default());
+            assert!(!cs.is_overset(), "{composer:?}");
+            let lines = all_lines(&cs);
+            assert!(lines.iter().any(|l| l.hyphenated), "{composer:?}");
+            for line in lines {
+                assert_hyphenation_cluster_anchors(line);
+                if line.hyphenated {
+                    let last = line.glyphs.iter().rfind(|g| g.len > 0).unwrap();
+                    let end = last.byte + last.len;
+                    let start = text[..end].rfind(' ').map_or(0, |p| p + 1);
+                    assert!(expected_ends.contains(&text[start..end].chars().count()), "{composer:?}: wrong source character index");
+                }
+            }
+            assert_eq!(d.story(sid).unwrap().text.as_str(), text.as_str());
+        }
+    }
+}
+
+#[test]
+fn russian_final_stress_preserves_full_word_exceptions_cache_and_no_break() {
+    for (text, automatic, exception) in [
+        ("берёза\u{0301}", vec![4, 8], "бе~рёза\u{0301}"),
+        ("помните\u{0301}", vec![10], "по~мните\u{0301}"),
+        ("типография\u{0301}", vec![4, 8, 14], "ти~пография\u{0301}"),
+    ] {
+        for composer in [Composer::Paragraph, Composer::SingleLine] {
+            let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 300.0), ParaAttrs { composer: Some(composer), ..Default::default() });
+            d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+                f.over.font_family = Some("Inter".into());
+                f.over.language = Some("Russian".into());
+            });
+            let (glyphs, _) = automatic_hyphenation_glyphs(&d, sid);
+            assert!(glyphs.last().is_some_and(|g| g.len == 0), "{text}: exercise a final non-owning accent glyph");
+            assert_eq!(shape::source_end(&glyphs), text.len());
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), automatic, "{text}: complete-word lookup");
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), automatic, "{text}: warm automatic cache");
+
+            d.hyphenation_exceptions = vec![text.into()];
+            assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "{text}: exact prohibition overrides warm cache");
+            d.hyphenation_exceptions = vec![exception.into()];
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4], "{text}: exact break override");
+            d.hyphenation_exceptions.clear();
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), automatic, "{text}: exception did not poison automatic cache");
+
+            d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(true));
+            assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "{text}: No Break after cache warm-up");
+            d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(false));
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), automatic);
+            assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+
+            let first_end = text.chars().next().unwrap().len_utf8();
+            let explicit = format!("{}\u{ad}{}", &text[..first_end], &text[first_end..]);
+            let (mut d, sid, _) =
+                doc_with(&explicit, Rect::new(0.0, 0.0, 400.0, 300.0), ParaAttrs { composer: Some(composer), ..Default::default() });
+            d.story_mut(sid).unwrap().format_chars(0..explicit.len(), |f| {
+                f.over.font_family = Some("Inter".into());
+                f.over.language = Some("Russian".into());
+            });
+            assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "{text}: discretionary suppresses automatic lookup");
+        }
+    }
+}
+
+#[test]
+fn both_composers_break_after_the_entire_stressed_cluster_and_anchor_the_hyphen_at_its_end() {
+    for (text, exception, end, automatic) in [
+        ("типо\u{0301}графия", "типо\u{0301}~графия", 10, vec![4, 10, 16]),
+        ("помни\u{0301}те", "помни\u{0301}~те", 12, vec![12]),
+        ("бере\u{0308}\u{0301}за", "бере\u{0308}\u{0301}~за", 12, vec![4, 12]),
+    ] {
+        for composer in [Composer::Paragraph, Composer::SingleLine] {
+            let para = ParaAttrs { composer: Some(composer), hyph_zone: Some(0.0), align: Some(Align::Left), ..Default::default() };
+            let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 400.0, 300.0), para.clone());
+            d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+                f.over.font_family = Some("Inter".into());
+                f.over.language = Some("Russian".into());
+            });
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), automatic);
+            d.hyphenation_exceptions = vec![exception.into()];
+            let (glyphs, points) = automatic_hyphenation_glyphs(&d, sid);
+            assert_eq!(points.iter().filter(|&&p| p).count(), 1);
+            let last = points.iter().position(|&p| p).unwrap();
+            let base = shape::hyphen_base(&glyphs[..=last]).unwrap();
+            assert_eq!(glyphs[last].len, 0, "{text}: the break must follow the accent");
+            assert_eq!(glyphs[last].byte, base.byte);
+            assert!(glyphs.get(last + 1).is_none_or(|next| next.byte != base.byte));
+            assert_eq!(shape::source_end(&glyphs[..=last]), end);
+            let prefix: f64 = glyphs[..=last].iter().map(|g| g.adv).sum();
+            let suffix: f64 = glyphs[last + 1..].iter().map(|g| g.adv).sum();
+            let hyphen = shape::hyphen_after(base, end);
+            let measure = (prefix + hyphen.adv).max(suffix) + 0.25;
+            assert!(measure < prefix + suffix, "{text}: force the only permitted hyphenation point");
+
+            let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, measure, 300.0), para);
+            d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+                f.over.font_family = Some("Inter".into());
+                f.over.language = Some("Russian".into());
+            });
+            d.hyphenation_exceptions = vec![exception.into()];
+            let cs = compose_story(&d, sid, &ComposeOptions::default());
+            assert!(!cs.is_overset(), "{composer:?}: {text}");
+            let lines = all_lines(&cs);
+            let broken = lines.iter().find(|line| line.hyphenated).unwrap();
+            assert_eq!(broken.range.end, end, "{composer:?}: {text}");
+            assert_eq!(broken.glyphs.last().unwrap().byte, end);
+            for line in &lines {
+                assert_hyphenation_cluster_anchors(line);
+            }
+            assert_eq!(lines.first().unwrap().range.start, 0);
+            assert_eq!(lines.last().unwrap().range.end, text.len());
+
+            d.hyphenation_exceptions = vec![text.into()];
+            let prohibited = compose_story(&d, sid, &ComposeOptions::default());
+            assert!(all_lines(&prohibited).iter().all(|line| !line.hyphenated), "{composer:?}: exact source prohibition");
+            d.hyphenation_exceptions = vec![exception.into()];
+            d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(true));
+            let protected = compose_story(&d, sid, &ComposeOptions::default());
+            assert!(all_lines(&protected).iter().all(|line| !line.hyphenated), "{composer:?}: No Break");
+            for line in all_lines(&protected) {
+                assert_hyphenation_cluster_anchors(line);
+            }
+            assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+        }
+    }
+}
+
+// Deliberately split a source grapheme into separate character-format/shaping segments.
+fn styled_russian_mark_doc(text: &str, mark: Range<usize>, composer: Composer, measure: f64) -> (Document, StoryId) {
+    let para = ParaAttrs {
+        composer: Some(composer),
+        hyphenate: Some(true),
+        hyph_last_word: Some(true),
+        hyph_min_word: Some(5),
+        hyph_zone: Some(0.0),
+        hyph_weight: Some(0.0),
+        ..Default::default()
+    };
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, measure, 300.0), para);
+    let story = d.story_mut(sid).unwrap();
+    story.format_chars(0..text.len(), |f| {
+        f.over.font_family = Some("Inter".into());
+        f.over.font_style = Some("Regular".into());
+        f.over.size = Some(12.0);
+        f.over.language = Some("Russian".into());
+    });
+    story.format_chars(mark, |f| f.over.size = Some(13.0));
+    (d, sid)
+}
+
+#[test]
+fn run31_streaming_grapheme_guard_keeps_full_source_context_and_clusters() {
+    // Only source positions matter to this guard. Use one bundled-font glyph as a
+    // template so the RI checks do not depend on installed emoji fonts or timing.
+    let (d, sid) = styled_russian_mark_doc("a", 0..0, Composer::Paragraph, 400.0);
+    let template = automatic_hyphenation_glyphs(&d, sid).0.remove(0);
+    let prefix = "lead\n";
+    let regional = "\u{1f1f7}".repeat(512);
+    let text = format!("{prefix}{regional}е\u{0308}x");
+    let regional_end = prefix.len() + regional.len();
+    let mark = regional_end + "е".len();
+    // Also start within a flag and deep within the RI run. Segmenting a fresh
+    // substring would lose the preceding RI parity and permit the wrong breaks.
+    for skipped in [0, 1, 2, 255] {
+        let start = prefix.len() + skipped * 4;
+        let mut glyphs: Vec<_> = text[start..]
+            .char_indices()
+            .map(|(byte, ch)| {
+                let mut g = template.clone();
+                g.byte = start + byte;
+                g.len = ch.len_utf8();
+                g.ch = ch;
+                g.break_after = None;
+                g
+            })
+            .collect();
+        let mut continuation = glyphs[0].clone();
+        continuation.len = 0;
+        glyphs.insert(1, continuation);
+        let protected = regional_end - 4;
+        glyphs.iter_mut().find(|g| g.byte == protected).unwrap().break_after = Some(false);
+        shape::constrain_source_graphemes(&text, start, &mut glyphs);
+        for pair in glyphs.windows(2) {
+            let (prev, next) = (&pair[0], &pair[1]);
+            let source_boundary = if next.byte < regional_end { (next.byte - prefix.len()).is_multiple_of(8) } else { next.byte != mark };
+            let forbidden = prev.byte == next.byte || !source_boundary || prev.byte == protected;
+            assert_eq!(prev.break_after == Some(false), forbidden, "start={start}, boundary={}", next.byte);
+        }
+    }
+}
+
+#[test]
+fn run31_emergency_wrap_keeps_separately_styled_russian_graphemes() {
+    for composer in [Composer::Paragraph, Composer::SingleLine] {
+        // The reduced pair forces the paragraph composer's only emergency candidate
+        // inside the grapheme. The closing bracket also exercises greedy backtracking.
+        for text in ["бере\u{0308}за", "е\u{0308}", "е\u{0308})"] {
+            let mark = text.find('\u{0308}').unwrap();
+            let make = |measure, hyphenate| {
+                let (mut d, sid) = styled_russian_mark_doc(text, mark..mark + 2, composer, measure);
+                let story = d.story_mut(sid).unwrap();
+                story.paras[0].para.hyphenate = Some(hyphenate);
+                story.format_chars(0..text.len(), |f| f.over.tracking = Some(500.0));
+                // A whole-word exception suppresses automatic points even when enabled.
+                d.hyphenation_exceptions = vec![text.into()];
+                (d, sid)
+            };
+            let (wide, sid) = make(400.0, false);
+            let (glyphs, _) = automatic_hyphenation_glyphs(&wide, sid);
+            let split = glyphs.iter().position(|g| g.byte == mark && g.len == 2).unwrap();
+            let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+            let accent: f64 = glyphs[split..].iter().take_while(|g| g.byte == mark).map(|g| g.adv).sum();
+            assert!(accent > 0.1, "positive tracking makes the separately styled mark overflow");
+            let measure = prefix + accent * 0.5;
+            assert_eq!(all_lines(&compose_story(&wide, sid, &ComposeOptions::default())).len(), 1);
+            for hyphenate in [false, true] {
+                let (d, sid) = make(measure, hyphenate);
+                assert!(automatic_hyphenation_bytes(&d, sid).is_empty());
+                let cs = compose_story(&d, sid, &ComposeOptions::default());
+                assert!(!cs.is_overset(), "{composer:?}: {text:?}");
+                let lines = all_lines(&cs);
+                assert!(!lines.is_empty());
+                let mut end = 0;
+                for line in &lines {
+                    assert_eq!(line.range.start, end, "source ranges remain contiguous");
+                    assert!(!line.hyphenated, "exercise emergency wrapping without automatic or explicit hyphens");
+                    for byte in [line.range.start, line.range.end] {
+                        let mut boundary = unicode_segmentation::GraphemeCursor::new(byte, text.len(), true);
+                        assert_eq!(boundary.is_boundary(text, 0), Ok(true), "{composer:?}: {text:?} split at {byte}");
+                    }
+                    assert_hyphenation_cluster_anchors(line);
+                    end = line.range.end;
+                }
+                assert_eq!(end, text.len());
+                if text == "е\u{0308}" {
+                    assert_eq!(lines.len(), 1, "one indivisible grapheme may exceed the measure");
+                } else if text == "бере\u{0308}за" {
+                    assert!(lines.len() > 1, "the overlong source still wraps");
+                }
+                assert_eq!(d.story(sid).unwrap().text, text);
+            }
+        }
+    }
+}
+
+#[test]
+fn run31_emergency_wrap_retains_english_spanish_no_break_and_jidori() {
+    for composer in [Composer::Paragraph, Composer::SingleLine] {
+        for (text, language) in [("typography", "English: USA"), ("transición", "Spanish")] {
+            let (mut d, sid, _) = doc_with(
+                text,
+                Rect::new(0.0, 0.0, 20.0, 300.0),
+                ParaAttrs { composer: Some(composer), hyphenate: Some(false), ..Default::default() },
+            );
+            d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+                f.over.font_family = Some("Inter".into());
+                f.over.font_style = Some("Regular".into());
+                f.over.size = Some(12.0);
+                f.over.language = Some(language.into());
+            });
+            let cs = compose_story(&d, sid, &ComposeOptions::default());
+            assert!(!cs.is_overset());
+            let lines = all_lines(&cs);
+            assert!(lines.len() > 1, "{composer:?}: ordinary {language} boundaries still wrap");
+            assert!(lines.iter().all(|line| !line.hyphenated));
+            assert_eq!(lines.last().unwrap().range.end, text.len());
+            for jidori in [false, true] {
+                d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+                    f.over.no_break = Some(!jidori);
+                    f.over.jidori = Some(if jidori { 12 } else { 0 });
+                });
+                let cs = compose_story(&d, sid, &ComposeOptions::default());
+                assert!(!cs.is_overset());
+                let lines = all_lines(&cs);
+                assert_eq!(lines.len(), 1, "{composer:?}: {language}, Jidori={jidori} stays indivisible");
+                assert_eq!(lines[0].range, 0..text.len());
+            }
+        }
+    }
+}
+
+#[test]
+fn separately_styled_final_stress_uses_full_source_exceptions_in_both_composers() {
+    let text = "помните\u{0301}";
+    for composer in [Composer::Paragraph, Composer::SingleLine] {
+        let (d, sid) = styled_russian_mark_doc(text, 14..16, composer, 400.0);
+        let (glyphs, _) = automatic_hyphenation_glyphs(&d, sid);
+        let mark = glyphs.iter().find(|g| g.byte == 14 && g.len == 2).unwrap();
+        assert_eq!(mark.ch, '\u{0301}', "exercise a byte-owning, independently styled mark");
+        assert_eq!(mark.size, 13.0);
+        // Both the built-in point (10) and override (4) fit, but the complete word does not.
+        let measure = [4, 10]
+            .into_iter()
+            .map(|end| {
+                let split = glyphs.iter().position(|g| g.byte >= end).unwrap();
+                let base = glyphs[..split].iter().rfind(|g| g.len > 0).unwrap();
+                let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+                let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+                (prefix + shape::hyphen_after(base, end).adv).max(suffix)
+            })
+            .fold(0.0, f64::max)
+            + 0.25;
+        assert!(measure < glyphs.iter().map(|g| g.adv).sum::<f64>());
+        let (mut d, sid) = styled_russian_mark_doc(text, 14..16, composer, measure);
+        let cache = Cache::new();
+        let mut previous = None;
+        for (exception, expected) in [(None, Some(10)), (Some(text), None), (Some("по~мните\u{0301}"), Some(4)), (None, Some(10)), (Some(text), None)]
+        {
+            d.hyphenation_exceptions = exception.into_iter().map(str::to_string).collect();
+            for _ in 0..2 {
+                assert_eq!(automatic_hyphenation_bytes(&d, sid), expected.into_iter().collect::<Vec<_>>(), "{composer:?}: {exception:?}");
+            }
+            let cold = cache.get(&d, sid, None);
+            let warm = cache.get(&d, sid, None);
+            assert!(Arc::ptr_eq(&cold, &warm), "reuse the warm composition");
+            if let Some(previous) = previous {
+                assert!(!Arc::ptr_eq(&cold, &previous), "exception changes invalidate the composition");
+            }
+            assert!(!cold.is_overset(), "{composer:?}");
+            let lines = all_lines(&cold);
+            let ends: Vec<_> = lines.iter().filter(|line| line.hyphenated).map(|line| line.range.end).collect();
+            assert_eq!(ends, expected.into_iter().collect::<Vec<_>>(), "{composer:?}: {exception:?}");
+            for line in &lines {
+                assert_hyphenation_cluster_anchors(line);
+            }
+            assert_eq!(lines.iter().flat_map(|line| &line.glyphs).filter(|g| g.byte == 14 && g.len == 2).count(), 1);
+            assert_eq!(lines.first().unwrap().range.start, 0);
+            assert_eq!(lines.last().unwrap().range.end, text.len());
+            assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+            previous = Some(cold);
+        }
+    }
+}
+
+#[test]
+fn separately_styled_diaeresis_keeps_source_graphemes_and_letter_hyphen_metrics() {
+    let text = "бере\u{0308}за";
+    for composer in [Composer::Paragraph, Composer::SingleLine] {
+        let (mut d, sid) = styled_russian_mark_doc(text, 8..10, composer, 400.0);
+        d.story_mut(sid).unwrap().format_chars(8..10, |f| {
+            f.over.font_style = Some("Medium".into());
+            f.over.size = Some(30.0);
+        });
+        for _ in 0..2 {
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 10], "{composer:?}: lookup the complete decomposed word");
+        }
+        d.story_mut(sid).unwrap().format_chars(8..10, |f| f.over.no_break = Some(true));
+        for _ in 0..2 {
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4], "a protected mark blocks its own endpoint, not an earlier point");
+        }
+        d.hyphenation_exceptions = vec!["бере\u{0308}~за".into()];
+        assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "No Break also gates the exception at the mark's endpoint");
+        d.story_mut(sid).unwrap().format_chars(8..10, |f| f.over.no_break = Some(false));
+        assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![10]);
+        // This exception is on a style/cluster boundary but inside the source grapheme.
+        d.hyphenation_exceptions = vec!["бере~\u{0308}за".into()];
+        assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "never break before the separately styled diaeresis");
+        d.hyphenation_exceptions = vec!["бере\u{0308}~за".into()];
+        let (glyphs, points) = automatic_hyphenation_glyphs(&d, sid);
+        let last = points.iter().position(|&p| p).unwrap();
+        assert_eq!(shape::source_end(&glyphs[..=last]), 10);
+        let mark = glyphs.iter().find(|g| g.byte == 8 && g.len == 2).unwrap();
+        assert_eq!(mark.ch, '\u{0308}');
+        let letter = glyphs.iter().find(|g| g.byte == 6 && g.len > 0).unwrap();
+        assert_eq!(letter.ch, 'е');
+        assert_ne!(mark.face, letter.face, "exercise distinct bundled faces");
+        assert_eq!(mark.size, 30.0);
+        assert_eq!(letter.size, 12.0);
+        assert_eq!(shape::hyphen_base(&glyphs[..=last]).unwrap().byte, letter.byte);
+        let hyphen = shape::hyphen_after(letter, 10);
+        let prefix: f64 = glyphs[..=last].iter().map(|g| g.adv).sum();
+        let suffix: f64 = glyphs[last + 1..].iter().map(|g| g.adv).sum();
+        let measure = (prefix + hyphen.adv).max(suffix) + 0.25;
+        assert!(measure < prefix + suffix, "force the only permitted break");
+        assert!(prefix + shape::hyphen_after(mark, 10).adv > measure, "the mark's hyphen would not fit");
+
+        let (mut d, sid) = styled_russian_mark_doc(text, 8..10, composer, measure);
+        d.story_mut(sid).unwrap().format_chars(8..10, |f| {
+            f.over.font_style = Some("Medium".into());
+            f.over.size = Some(30.0);
+        });
+        d.hyphenation_exceptions = vec!["бере\u{0308}~за".into()];
+        for _ in 0..2 {
+            let cs = compose_story(&d, sid, &ComposeOptions::default());
+            assert!(!cs.is_overset(), "{composer:?}");
+            let lines = all_lines(&cs);
+            let first = lines.first().unwrap();
+            assert!(first.hyphenated, "{composer:?}: both width estimators must use the letter");
+            assert_eq!(first.range, 0..10);
+            let h = first.glyphs.last().unwrap();
+            assert_eq!((h.byte, h.len), (10, 0));
+            assert_eq!(h.face, letter.face);
+            assert_eq!(h.gid, hyphen.gid);
+            assert_eq!((h.sx, h.sy), (letter.sx, letter.sy));
+            let placed_letter = first.glyphs.iter().find(|g| g.byte == 6 && g.len > 0).unwrap();
+            assert_eq!(h.style, placed_letter.style, "the hyphen inherits the letter's character style");
+            assert_eq!(first.glyphs.iter().find(|g| g.byte == 8 && g.len == 2).unwrap().face, mark.face);
+            assert!((first.end_x - first.x0 - prefix - hyphen.adv).abs() < 1e-6, "{composer:?}: estimated and placed advances agree");
+            for line in &lines {
+                assert_hyphenation_cluster_anchors(line);
+            }
+            assert_eq!(lines.last().unwrap().range.end, text.len());
+        }
+        d.hyphenation_exceptions.clear();
+        assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 10], "exceptions do not poison the automatic cache");
+        assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+    }
+}
+
+#[test]
+fn separately_styled_marks_participate_in_language_no_break_and_discretionary_checks() {
+    let text = "помните\u{0301}";
+    for composer in [Composer::Paragraph, Composer::SingleLine] {
+        let (d, sid) = styled_russian_mark_doc(text, 14..16, composer, 400.0);
+        let (glyphs, _) = automatic_hyphenation_glyphs(&d, sid);
+        let split = glyphs.iter().position(|g| g.byte >= 10).unwrap();
+        let base = &glyphs[split - 1];
+        let measure = glyphs[..split].iter().map(|g| g.adv).sum::<f64>() + shape::hyphen_after(base, 10).adv + 0.25;
+        assert!(measure < glyphs.iter().map(|g| g.adv).sum::<f64>());
+        let (mut d, sid) = styled_russian_mark_doc(text, 14..16, composer, measure);
+        assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![10]);
+        for exception in [None, Some("по~мните\u{0301}")] {
+            d.hyphenation_exceptions = exception.into_iter().map(str::to_string).collect();
+            d.story_mut(sid).unwrap().format_chars(14..16, |f| f.over.language = Some("French".into()));
+            for _ in 0..2 {
+                assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "the mark's unsupported language rejects the complete word");
+                let cs = compose_story(&d, sid, &ComposeOptions::default());
+                assert!(all_lines(&cs).iter().all(|line| !line.hyphenated), "{composer:?}: language agreement also gates exceptions");
+            }
+            d.story_mut(sid).unwrap().format_chars(14..16, |f| {
+                f.over.language = Some("Russian".into());
+                f.over.no_break = Some(true);
+            });
+            let expected = if exception.is_some() { 4 } else { 10 };
+            for _ in 0..2 {
+                assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![expected], "a protected final mark leaves earlier word points available");
+                let cs = compose_story(&d, sid, &ComposeOptions::default());
+                let ends: Vec<_> = all_lines(&cs).iter().filter(|line| line.hyphenated).map(|line| line.range.end).collect();
+                assert_eq!(ends, vec![expected], "{composer:?}: partial No Break does not veto the word");
+            }
+            d.story_mut(sid).unwrap().format_chars(14..16, |f| f.over.no_break = Some(false));
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![expected], "restoring the mark's controls restores the cached points");
+        }
+
+        d.hyphenation_exceptions = vec!["помните~\u{0301}".into()];
+        d.story_mut(sid).unwrap().format_chars(14..16, |f| f.over.no_break = Some(true));
+        for _ in 0..2 {
+            assert!(automatic_hyphenation_bytes(&d, sid).is_empty(), "the full-source exception cannot split the base from its protected mark");
+            let cs = compose_story(&d, sid, &ComposeOptions::default());
+            assert!(all_lines(&cs).iter().all(|line| !line.hyphenated), "{composer:?}: no break before the mark");
+        }
+
+        let explicit = "типо\u{0301}\u{ad}графия";
+        let (d, sid) = styled_russian_mark_doc(explicit, 8..10, composer, 400.0);
+        let (glyphs, points) = automatic_hyphenation_glyphs(&d, sid);
+        assert!(points.iter().all(|&p| !p), "the styled mark must not hide the following discretionary hyphen");
+        let split = glyphs.iter().position(|g| g.byte >= 12).unwrap();
+        let letter = glyphs[..split].iter().rfind(|g| g.ch == 'о' && g.len > 0).unwrap();
+        let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+        let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+        let measure = (prefix + shape::hyphen_after(letter, 12).adv).max(suffix) + 1.0;
+        assert!(measure < prefix + suffix);
+        let (d, sid) = styled_russian_mark_doc(explicit, 8..10, composer, measure);
+        for _ in 0..2 {
+            assert!(automatic_hyphenation_bytes(&d, sid).is_empty());
+            let cs = compose_story(&d, sid, &ComposeOptions::default());
+            assert!(!cs.is_overset(), "{composer:?}");
+            let ends: Vec<_> = all_lines(&cs).iter().filter(|line| line.hyphenated).map(|line| line.range.end).collect();
+            assert_eq!(ends, vec![12], "{composer:?}: only the discretionary point is used");
+        }
+    }
+}
+
+#[test]
+fn both_composers_measure_and_place_discretionary_hyphens_from_the_letter() {
+    let text = "помни\u{0301}\u{ad}те";
+    for composer in [Composer::Paragraph, Composer::SingleLine] {
+        let make_doc = |measure| {
+            let (mut d, sid) = styled_russian_mark_doc(text, 10..12, composer, measure);
+            d.story_mut(sid).unwrap().format_chars(10..14, |f| {
+                f.over.font_style = Some("Medium".into());
+                f.over.size = Some(30.0);
+            });
+            (d, sid)
+        };
+        let (d, sid) = make_doc(400.0);
+        let (glyphs, points) = automatic_hyphenation_glyphs(&d, sid);
+        assert!(points.iter().all(|p| !p));
+        let split = glyphs.iter().position(|g| g.byte >= 14).unwrap();
+        let base = shape::hyphen_base(&glyphs[..split]).unwrap();
+        assert_eq!(base.byte, 8);
+        assert_eq!(base.size, 12.0);
+        let hyphen = shape::hyphen_after(base, 14);
+        let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+        let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+        let measure = (prefix + hyphen.adv).max(suffix) + 0.25;
+        assert!(measure < prefix + suffix);
+        let (mut d, sid) = make_doc(measure);
+        let cs = compose_story(&d, sid, &ComposeOptions::default());
+        let line = all_lines(&cs).into_iter().find(|line| line.hyphenated).unwrap();
+        assert_eq!(line.range.end, 14, "{composer:?}");
+        let placed = line.glyphs.last().unwrap();
+        assert_eq!(placed.byte, 14);
+        assert_eq!(placed.face, base.face);
+        assert_eq!(placed.gid, hyphen.gid);
+        assert_eq!((placed.sx, placed.sy), (base.sx, base.sy));
+        assert!((line.end_x - line.x0 - prefix - hyphen.adv).abs() < 1e-6, "{composer:?}");
+        d.story_mut(sid).unwrap().format_chars(12..14, |f| f.over.no_break = Some(true));
+        let protected = compose_story(&d, sid, &ComposeOptions::default());
+        assert!(all_lines(&protected).iter().all(|line| !line.hyphenated), "{composer:?}: a protected marker is not a break opportunity");
+        assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+    }
+}
+
+#[test]
+fn partial_word_no_break_keeps_full_word_points_outside_the_protected_span() {
+    let text = "типография";
+    for composer in [Composer::Paragraph, Composer::SingleLine] {
+        let make_doc = |measure| {
+            let para = ParaAttrs {
+                composer: Some(composer),
+                hyphenate: Some(true),
+                hyph_last_word: Some(true),
+                hyph_min_word: Some(5),
+                hyph_zone: Some(0.0),
+                hyph_weight: Some(0.0),
+                ..Default::default()
+            };
+            let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, measure, 300.0), para);
+            let story = d.story_mut(sid).unwrap();
+            story.format_chars(0..text.len(), |f| {
+                f.over.font_family = Some("Inter".into());
+                f.over.font_style = Some("Regular".into());
+                f.over.size = Some(12.0);
+                f.over.language = Some("Russian".into());
+            });
+            // Protect "пог": byte 8 is inside it, while bytes 4 and 14 are outside.
+            story.format_chars(4..10, |f| f.over.no_break = Some(true));
+            (d, sid)
+        };
+        let (mut d, sid) = make_doc(400.0);
+        d.story_mut(sid).unwrap().format_chars(4..10, |f| f.over.no_break = Some(false));
+        assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 8, 14]);
+        d.story_mut(sid).unwrap().format_chars(4..10, |f| f.over.no_break = Some(true));
+        for _ in 0..2 {
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 14], "retain full-word points on both sides of the protected span");
+        }
+        let (glyphs, _) = automatic_hyphenation_glyphs(&d, sid);
+        assert!(glyphs.iter().find(|g| g.byte == 6 && g.len > 0).unwrap().no_break);
+        for (exception, end, allowed) in [("ти~пография", 4, true), ("типо~графия", 8, false), ("типогра~фия", 14, true)]
+        {
+            let split = glyphs.iter().position(|g| g.byte >= end).unwrap();
+            let base = glyphs[..split].iter().rfind(|g| g.len > 0).unwrap();
+            let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+            let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+            let measure = (prefix + shape::hyphen_after(base, end).adv).max(suffix) + 0.25;
+            assert!(measure < prefix + suffix);
+            let (mut d, sid) = make_doc(measure);
+            d.hyphenation_exceptions = vec![exception.into()];
+            let expected = if allowed { vec![end] } else { vec![] };
+            for _ in 0..2 {
+                assert_eq!(automatic_hyphenation_bytes(&d, sid), expected, "{composer:?}: {exception}");
+                let cs = compose_story(&d, sid, &ComposeOptions::default());
+                assert!(!cs.is_overset(), "{composer:?}: {exception}");
+                let ends: Vec<_> = all_lines(&cs).iter().filter(|line| line.hyphenated).map(|line| line.range.end).collect();
+                assert_eq!(ends, expected, "{composer:?}: {exception}");
+            }
+        }
+        d.story_mut(sid).unwrap().format_chars(4..10, |f| f.over.no_break = Some(false));
+        assert_eq!(automatic_hyphenation_bytes(&d, sid), vec![4, 8, 14], "No Break filtering does not poison cached word points");
+        assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+    }
+}
+
+// Keep the intended hyphen as the only fitting two-line split when balancing retries
+// narrower measures and upstream emergency wrapping becomes available.
+fn r34_size_balanced_suffix(d: &mut Document, sid: StoryId, end: usize) {
+    let story = d.story(sid).unwrap();
+    let (pp, _) = d.styles.resolve_para(&story.paras[0]);
+    if pp.composer != Composer::Paragraph || !pp.balance_ragged {
+        return;
+    }
+    let text = story.text.clone();
+    let context = format!("{:?} balance={} text={text:?} end={end}", pp.composer, pp.balance_ragged);
+    assert!(end > 0 && end < text.len() && text.is_char_boundary(end), "{context}");
+
+    // Create the final run boundary before measuring: splitting a run can change kerning.
+    d.story_mut(sid).unwrap().format_chars(end..text.len(), |f| f.over.h_scale = Some(1.0));
+    let (glyphs, _) = automatic_hyphenation_glyphs(d, sid);
+    let split = glyphs.iter().position(|g| g.byte >= end).unwrap();
+    let base = shape::hyphen_base(&glyphs[..split]).unwrap();
+    let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+    let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+    let target = prefix + shape::hyphen_after(base, end).adv;
+    assert!(target.is_finite() && target > 0.0 && suffix.is_finite() && suffix > 0.0, "{context}");
+    let scale = target / suffix;
+    assert!(scale.is_finite() && scale > 0.0, "{context}");
+    d.story_mut(sid).unwrap().format_chars(end..text.len(), |f| f.over.h_scale = Some(scale));
+
+    let (glyphs, points) = automatic_hyphenation_glyphs(d, sid);
+    let split = glyphs.iter().position(|g| g.byte >= end).unwrap();
+    assert!(split > 0 && glyphs[split].byte == end, "{context}");
+    let before = &glyphs[split - 1];
+    assert!(
+        !before.no_break && before.break_after != Some(false) && (points[split - 1] || before.ch == shape::SOFT_HYPHEN),
+        "the intended hyphen must be available: {context}"
+    );
+    let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+    let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+    let hyphen = shape::hyphen_after(shape::hyphen_base(&glyphs[..split]).unwrap(), end).adv;
+    assert!((prefix + hyphen - suffix).abs() < 1e-6, "suffix sizing must use the final shaping: {context}");
+    let measure = (prefix + hyphen).max(suffix) + 0.25;
+    let total = prefix + suffix;
+    assert!(prefix + hyphen <= measure && suffix <= measure && total > measure, "{context}");
+
+    // Even a bare emergency break must leave one piece too wide at every other
+    // permissible source-grapheme boundary. Adding a hyphen cannot make it fit.
+    let mut left = 0.0;
+    for (i, pair) in glyphs.windows(2).enumerate() {
+        let (a, b) = (&pair[0], &pair[1]);
+        left += a.adv;
+        if b.byte == end || a.byte == b.byte || a.no_break || a.break_after == Some(false) || b.ch == shape::SOFT_HYPHEN {
+            continue;
+        }
+        assert!(text.is_char_boundary(b.byte), "{context}");
+        let mut boundary = unicode_segmentation::GraphemeCursor::new(b.byte, text.len(), true);
+        if boundary.is_boundary(&text, 0) != Ok(true) {
+            continue;
+        }
+        let right = total - left;
+        assert!(
+            left > measure + 0.01 || right > measure + 0.01,
+            "competing split at glyph {} byte {} fits: left={left} right={right} measure={measure}; {context}",
+            i + 1,
+            b.byte
+        );
+    }
+}
+
+// Keep every oracle usable on frozen R5; these helpers are deliberately test-local.
+fn r5_cached_hyphenation(
+    d: &Document,
+    sid: StoryId,
+    cache: &Cache,
+    previous: &mut Option<Arc<ComposedStory>>,
+    points: &[usize],
+    ends: &[usize],
+) -> Arc<ComposedStory> {
+    for _ in 0..2 {
+        assert_eq!(automatic_hyphenation_bytes(d, sid), points);
+    }
+    let cold = cache.get(d, sid, None);
+    let warm = cache.get(d, sid, None);
+    assert!(Arc::ptr_eq(&cold, &warm), "unchanged inputs reuse the composition");
+    if let Some(previous) = previous.as_ref() {
+        assert!(!Arc::ptr_eq(&cold, previous), "changed language/style/control/exception inputs invalidate the composition");
+    }
+    assert!(!cold.is_overset());
+    let lines = all_lines(&cold);
+    let story = d.story(sid).unwrap();
+    let (pp, _) = d.styles.resolve_para(&story.paras[0]);
+    assert_eq!(
+        lines.iter().filter(|line| line.hyphenated).map(|line| line.range.end).collect::<Vec<_>>(),
+        ends,
+        "{:?} balance={} text={:?} exceptions={:?} lines={:?} runs={:?}",
+        pp.composer,
+        pp.balance_ragged,
+        story.text,
+        d.hyphenation_exceptions,
+        lines.iter().map(|line| (&line.range, line.hyphenated)).collect::<Vec<_>>(),
+        story.runs().map(|(range, f)| (range, f.over.no_break, f.over.language.as_deref(), f.over.size, f.over.h_scale)).collect::<Vec<_>>()
+    );
+    assert_eq!(lines.first().unwrap().range.start, 0);
+    assert_eq!(lines.last().unwrap().range.end, d.story(sid).unwrap().text.len());
+    for line in lines {
+        assert_hyphenation_cluster_anchors(line);
+    }
+    *previous = Some(cold.clone());
+    cold
+}
+
+#[test]
+fn r5_leading_stress_keeps_full_source_lookup_language_exceptions_and_cache() {
+    for stress in ['\u{0301}', '\u{0300}', '\u{0341}'] {
+        let text = format!("{stress}типография");
+        let allowed = format!("{stress}типо~графия");
+        assert_eq!(hyphen::word_breaks_in(&text, hyphen::Lang::Russian), (vec![], hyphen::Source::None));
+        for composer in [Composer::Paragraph, Composer::SingleLine] {
+            let (suffix, suffix_sid) = styled_russian_mark_doc("типография", 0..0, composer, 400.0);
+            for _ in 0..2 {
+                assert_eq!(automatic_hyphenation_bytes(&suffix, suffix_sid), vec![4, 8, 14]);
+            }
+            let (mut d, sid) = styled_russian_mark_doc(&text, 0..2, composer, 400.0);
+            let (glyphs, _) = automatic_hyphenation_glyphs(&d, sid);
+            let mark = glyphs.iter().find(|g| g.byte == 0 && g.len == 2).unwrap();
+            assert_eq!(mark.ch, stress, "exercise the leading source-owning orphan mark");
+            assert_eq!(glyphs.iter().find(|g| g.byte == 2 && g.len > 0).unwrap().ch, 'т');
+            let cache = Cache::new();
+            let mut previous = None;
+            for (exception, expected) in
+                [(None, vec![]), (Some(text.as_str()), vec![]), (Some(allowed.as_str()), vec![10]), (Some(text.as_str()), vec![]), (None, vec![])]
+            {
+                d.hyphenation_exceptions = exception.into_iter().map(str::to_string).collect();
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &expected, &[]);
+            }
+            d.hyphenation_exceptions = vec![allowed.clone()];
+            r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[10], &[]);
+            for language in ["French", "[No Language]", "English: USA"] {
+                d.story_mut(sid).unwrap().format_chars(0..2, |f| f.over.language = Some(language.into()));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+            }
+            d.story_mut(sid).unwrap().format_chars(0..2, |f| {
+                f.over.language = Some("Russian".into());
+                f.over.font_style = Some("Medium".into());
+                f.over.size = Some(30.0);
+            });
+            r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[10], &[]);
+            // No Break is still per candidate: protecting the prefix must not ban a later point.
+            d.story_mut(sid).unwrap().format_chars(0..2, |f| f.over.no_break = Some(true));
+            r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[10], &[]);
+            d.story_mut(sid).unwrap().format_chars(8..10, |f| f.over.no_break = Some(true));
+            r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+            d.story_mut(sid).unwrap().format_chars(8..10, |f| f.over.no_break = Some(false));
+            r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[10], &[]);
+            d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(false);
+            r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+            d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(true);
+            r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[10], &[]);
+            d.hyphenation_exceptions = vec![text.clone()];
+            r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+            assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+
+            // The same stress on the first letter is legitimate, and keeps original byte indices.
+            let canonical = format!("т{stress}ипография");
+            let (mut control, control_sid) = styled_russian_mark_doc(&canonical, 2..4, composer, 400.0);
+            let control_cache = Cache::new();
+            let mut control_previous = None;
+            r5_cached_hyphenation(&control, control_sid, &control_cache, &mut control_previous, &[6, 10, 16], &[]);
+            control.hyphenation_exceptions = vec![canonical.clone()];
+            r5_cached_hyphenation(&control, control_sid, &control_cache, &mut control_previous, &[], &[]);
+            control.hyphenation_exceptions.clear();
+            r5_cached_hyphenation(&control, control_sid, &control_cache, &mut control_previous, &[6, 10, 16], &[]);
+            assert_eq!(control.story(control_sid).unwrap().text.as_str(), canonical);
+
+            // A real word separator isolates the orphan mark; punctuation remains a separator too.
+            for (source, expected) in [(format!("{stress} типография"), vec![7, 11, 17]), ("«типография»".into(), vec![6, 10, 16])]
+            {
+                let (control, control_sid) = styled_russian_mark_doc(&source, 0..2, composer, 400.0);
+                r5_cached_hyphenation(&control, control_sid, &Cache::new(), &mut None, &expected, &[]);
+            }
+            assert_eq!(
+                automatic_hyphenation_bytes(&suffix, suffix_sid),
+                vec![4, 8, 14],
+                "invalid-source cache entries never poison the valid suffix"
+            );
+            let (mut english, english_sid) = styled_russian_mark_doc("typography", 0..0, composer, 400.0);
+            english.story_mut(english_sid).unwrap().format_chars(0..10, |f| f.over.language = Some("English: USA".into()));
+            r5_cached_hyphenation(&english, english_sid, &Cache::new(), &mut None, &[2, 5, 7], &[]);
+
+            // Expose the full-source exception in actual layout, then prohibit it again.
+            let split = glyphs.iter().position(|g| g.byte >= 10).unwrap();
+            let letter = glyphs.iter().find(|g| g.byte == 8 && g.len > 0).unwrap();
+            let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+            let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+            let measure = (prefix + shape::hyphen_after(letter, 10).adv).max(suffix) + 0.25;
+            assert!(measure < prefix + suffix);
+            let (mut narrow, narrow_sid) = styled_russian_mark_doc(&text, 0..2, composer, measure);
+            let narrow_cache = Cache::new();
+            let mut narrow_previous = None;
+            narrow.hyphenation_exceptions = vec![allowed.clone()];
+            r5_cached_hyphenation(&narrow, narrow_sid, &narrow_cache, &mut narrow_previous, &[10], &[10]);
+            narrow.hyphenation_exceptions = vec![text.clone()];
+            r5_cached_hyphenation(&narrow, narrow_sid, &narrow_cache, &mut narrow_previous, &[], &[]);
+            narrow.hyphenation_exceptions.clear();
+            r5_cached_hyphenation(&narrow, narrow_sid, &narrow_cache, &mut narrow_previous, &[], &[]);
+            assert_eq!(narrow.story(narrow_sid).unwrap().text.as_str(), text);
+        }
+    }
+}
+
+// Keep the R6 BEFORE oracles independent of the scanner-entry correction.
+fn r6_styled_prefix_doc(text: &str, prefix_len: usize, composer: Composer, balance: bool, measure: f64) -> (Document, StoryId) {
+    let (mut d, sid) = styled_russian_mark_doc(text, 0..prefix_len, composer, measure);
+    let story = d.story_mut(sid).unwrap();
+    for (byte, ch) in text[..prefix_len].char_indices() {
+        story.format_chars(byte..byte + ch.len_utf8(), |f| {
+            f.over.font_style = Some(if ch == shape::SOFT_HYPHEN { "SemiBold" } else { "Medium" }.into());
+            f.over.size = Some(if ch == shape::SOFT_HYPHEN { 24.0 } else { 30.0 });
+        });
+    }
+    story.paras[0].para.balance_ragged = Some(balance);
+    story.paras[0].para.hyph_capitalized = Some(true);
+    (d, sid)
+}
+
+fn r6_assert_prefix_ownership(text: &str, prefix_len: usize, glyphs: &[shape::Glyph]) {
+    for (byte, ch) in text[..prefix_len].char_indices() {
+        let owners: Vec<_> = glyphs.iter().filter(|g| g.byte == byte && g.len > 0).collect();
+        assert_eq!(owners.len(), 1, "each independently styled prefix character owns its bytes");
+        let g = owners[0];
+        assert_eq!((g.ch, g.len), (ch, ch.len_utf8()));
+        assert_eq!(g.size, if ch == shape::SOFT_HYPHEN { 24.0 } else { 30.0 });
+        if ch == shape::SOFT_HYPHEN {
+            assert_eq!(g.adv, 0.0);
+        }
+    }
+    assert!(glyphs.iter().any(|g| g.byte == prefix_len && g.len > 0 && g.ch == text[prefix_len..].chars().next().unwrap()));
+    assert_eq!(shape::source_end(glyphs), text.len());
+}
+
+#[test]
+fn r6_leading_joiners_keep_full_source_case_language_no_break_and_caches() {
+    for joiner in ['\u{200C}', '\u{200D}'] {
+        for word in ["типография", "ТиПоГрАфИя"] {
+            let text = format!("{joiner}{word}");
+            let allowed = format!("{joiner}типо~графия");
+            for (composer, balance) in [(Composer::Paragraph, false), (Composer::Paragraph, true), (Composer::SingleLine, false)] {
+                let (mut d, sid) = r6_styled_prefix_doc(&text, 3, composer, balance, 400.0);
+                let (glyphs, _) = automatic_hyphenation_glyphs(&d, sid);
+                r6_assert_prefix_ownership(&text, 3, &glyphs);
+                let cache = Cache::new();
+                let mut previous = None;
+                let points = [7, 11, 17];
+                // Leading joiners remain valid controls; mixed case is not an all-caps veto.
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                d.hyphenation_exceptions = vec![text.clone()];
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.hyphenation_exceptions = vec![allowed.clone()];
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[11], &[]);
+                for language in ["French", "English: USA", "[No Language]"] {
+                    d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.language = Some(language.into()));
+                    r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                }
+                d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.language = Some("Russian".into()));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[11], &[]);
+                d.hyphenation_exceptions.clear();
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.language = Some("French".into()));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.language = Some("ru-RU".into()));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                // Protecting a prefix must not veto a later, unprotected candidate.
+                d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.no_break = Some(true));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                d.story_mut(sid).unwrap().format_chars(9..11, |f| f.over.no_break = Some(true));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[7, 17], &[]);
+                d.hyphenation_exceptions = vec![allowed.clone()];
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().format_chars(9..11, |f| f.over.no_break = Some(false));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[11], &[]);
+                d.hyphenation_exceptions = vec![text.clone()];
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.hyphenation_exceptions.clear();
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(false);
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(true);
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                d.story_mut(sid).unwrap().paras[0].para.hyph_capitalized = Some(false);
+                let expected = if word.starts_with('Т') { &[][..] } else { &points[..] };
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, expected, &[]);
+                d.story_mut(sid).unwrap().paras[0].para.hyph_capitalized = Some(true);
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(true));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(false));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+                let (upper, upper_sid) = r6_styled_prefix_doc(&format!("{joiner}ТИПОГРАФИЯ"), 3, composer, balance, 400.0);
+                r5_cached_hyphenation(&upper, upper_sid, &Cache::new(), &mut None, &[], &[]);
+            }
+        }
+        // A real separator isolates the format prefix and its language from the Russian word.
+        for separator in [" ", "—"] {
+            let text = format!("{joiner}{separator}типография");
+            let start = 3 + separator.len();
+            for (composer, balance) in [(Composer::Paragraph, false), (Composer::Paragraph, true), (Composer::SingleLine, false)] {
+                let (mut d, sid) = r6_styled_prefix_doc(&text, 3, composer, balance, 400.0);
+                d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.language = Some("French".into()));
+                let points = [start + 4, start + 8, start + 14];
+                let cache = Cache::new();
+                let mut previous = None;
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+                d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.language = Some("Russian".into()));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &points, &[]);
+            }
+        }
+    }
+}
+
+#[test]
+fn r6_leading_joiner_controls_reach_both_composers_and_balance() {
+    for joiner in ['\u{200C}', '\u{200D}'] {
+        for word in ["помните", "ПоМнИтЕ"] {
+            let text = format!("{joiner}{word}");
+            let allowed = format!("{joiner}помни~те");
+            let end = 13;
+            for (composer, balance) in [(Composer::Paragraph, false), (Composer::Paragraph, true), (Composer::SingleLine, false)] {
+                let make_doc = |measure| {
+                    let (mut d, sid) = r6_styled_prefix_doc(&text, 3, composer, balance, measure);
+                    r34_size_balanced_suffix(&mut d, sid, end);
+                    (d, sid)
+                };
+                let (wide, wide_sid) = make_doc(400.0);
+                let (glyphs, _) = automatic_hyphenation_glyphs(&wide, wide_sid);
+                r6_assert_prefix_ownership(&text, 3, &glyphs);
+                assert_eq!(automatic_hyphenation_bytes(&wide, wide_sid), vec![end]);
+                let split = glyphs.iter().position(|g| g.byte >= end).unwrap();
+                let letter = glyphs.iter().find(|g| g.byte == 11 && g.len > 0).unwrap();
+                let hyphen = shape::hyphen_after(letter, end);
+                let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+                let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+                let measure = (prefix + hyphen.adv).max(suffix) + 0.25;
+                assert!(measure < prefix + suffix, "force the known dictionary/exception point");
+                let candidate = Break { start: 0, end: split, next: split, hyphen: true, forced: false };
+                assert!((breaker::line_width(&glyphs, &candidate) - prefix - hyphen.adv).abs() < 1e-6);
+                let (mut d, sid) = make_doc(measure);
+                let cache = Cache::new();
+                let mut previous = None;
+                let mut check = |d: &Document, points: &[usize], permitted: bool| {
+                    let ends: Vec<_> = permitted.then_some(end).into_iter().collect();
+                    let cs = r5_cached_hyphenation(d, sid, &cache, &mut previous, points, &ends);
+                    let lines = all_lines(&cs);
+                    assert_eq!(lines.iter().flat_map(|line| &line.glyphs).filter(|g| g.byte == 0 && g.len == 3).count(), 1);
+                    if permitted {
+                        assert_eq!(lines.len(), 2, "exercise balancing on an actual two-line paragraph");
+                        let line = lines.iter().find(|line| line.hyphenated).unwrap();
+                        assert_eq!(line.range, 0..end);
+                        // NoBreak edits split shaping runs; Some(false) does not restore the
+                        // original None override, so kerning advances can change after clearing it.
+                        let (current_glyphs, _) = automatic_hyphenation_glyphs(d, sid);
+                        let current_split = current_glyphs.iter().position(|g| g.byte >= end).unwrap();
+                        let current_letter = current_glyphs.iter().find(|g| g.byte == 11 && g.len > 0).unwrap();
+                        let current_hyphen = shape::hyphen_after(current_letter, end);
+                        let current_prefix: f64 = current_glyphs[..current_split].iter().map(|g| g.adv).sum();
+                        let natural_width = current_prefix + current_hyphen.adv;
+                        let current_candidate = Break { start: 0, end: current_split, next: current_split, hyphen: true, forced: false };
+                        assert!((breaker::line_width(&current_glyphs, &current_candidate) - natural_width).abs() < 1e-6);
+                        let h = line.glyphs.last().unwrap();
+                        let placed_letter = line.glyphs.iter().find(|g| g.byte == 11 && g.len > 0).unwrap();
+                        assert_eq!((h.byte, h.len, h.face, h.gid), (end, 0, current_letter.face, current_hyphen.gid));
+                        assert_eq!((h.sx, h.sy, h.style), (placed_letter.sx, placed_letter.sy, placed_letter.style));
+                        assert!((h.adv - current_hyphen.adv).abs() < 1e-6);
+                        let placed_width: f64 = line.glyphs.iter().map(|g| g.adv).sum();
+                        let context = format!(
+                            "{composer:?} balance={balance} text={text:?}: initial={} current={natural_width} placed={placed_width} end={} slot={} runs={:?}",
+                            prefix + hyphen.adv,
+                            line.end_x - line.x0,
+                            line.x1 - line.x0,
+                            d.story(sid).unwrap().runs().map(|(range, fmt)| (range, fmt.over.no_break)).collect::<Vec<_>>(),
+                        );
+                        if (natural_width - prefix - hyphen.adv).abs() >= 1e-6 {
+                            eprintln!("formatting changed the natural line width: {context}");
+                        }
+                        assert!((placed_width - natural_width).abs() < 1e-6, "{context}");
+                        assert!((line.end_x - line.x0 - natural_width).abs() < 1e-6, "{context}");
+                        assert!(line.end_x <= line.x1 + 1e-6, "{context}");
+                    }
+                    assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+                };
+                check(&d, &[end], true);
+                d.hyphenation_exceptions = vec![text.clone()];
+                check(&d, &[], false);
+                d.hyphenation_exceptions = vec![allowed.clone()];
+                check(&d, &[end], true);
+                for language in ["French", "English: USA", "[No Language]"] {
+                    d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.language = Some(language.into()));
+                    check(&d, &[], false);
+                }
+                d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.language = Some("Russian".into()));
+                check(&d, &[end], true);
+                d.hyphenation_exceptions.clear();
+                check(&d, &[end], true);
+                d.story_mut(sid).unwrap().format_chars(0..3, |f| f.over.no_break = Some(true));
+                check(&d, &[end], true);
+                d.story_mut(sid).unwrap().format_chars(11..13, |f| f.over.no_break = Some(true));
+                check(&d, &[], false);
+                d.hyphenation_exceptions = vec![allowed.clone()];
+                check(&d, &[], false);
+                d.story_mut(sid).unwrap().format_chars(11..13, |f| f.over.no_break = Some(false));
+                check(&d, &[end], true);
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(false);
+                check(&d, &[], false);
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(true);
+                check(&d, &[end], true);
+                d.story_mut(sid).unwrap().paras[0].para.hyph_last_word = Some(false);
+                check(&d, &[], false);
+                d.story_mut(sid).unwrap().paras[0].para.hyph_last_word = Some(true);
+                check(&d, &[end], true);
+            }
+        }
+    }
+}
+
+#[test]
+fn r6_leading_shy_with_joiners_suppresses_automatic_and_preserves_explicit_hyphens() {
+    for joiner in ['\u{200C}', '\u{200D}'] {
+        for prefix_text in ["\u{ad}".to_string(), format!("\u{ad}{joiner}"), format!("{joiner}\u{ad}")] {
+            let prefix_len = prefix_text.len();
+            for (composer, balance) in [(Composer::Paragraph, false), (Composer::Paragraph, true), (Composer::SingleLine, false)] {
+                let text = format!("{prefix_text}типография");
+                let (mut d, sid) = r6_styled_prefix_doc(&text, prefix_len, composer, balance, 400.0);
+                let (glyphs, _) = automatic_hyphenation_glyphs(&d, sid);
+                r6_assert_prefix_ownership(&text, prefix_len, &glyphs);
+                let cache = Cache::new();
+                let mut previous = None;
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.hyphenation_exceptions = vec![text.clone()];
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.hyphenation_exceptions = vec![format!("{prefix_text}типо~графия")];
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().format_chars(0..prefix_len, |f| f.over.language = Some("French".into()));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().format_chars(0..prefix_len, |f| f.over.language = Some("Russian".into()));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.hyphenation_exceptions.clear();
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(false);
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(true);
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                d.story_mut(sid).unwrap().format_chars(0..prefix_len, |f| f.over.no_break = Some(true));
+                r5_cached_hyphenation(&d, sid, &cache, &mut previous, &[], &[]);
+                // A space ends the prefix run and restores normal Russian automatic points.
+                let separated = format!("{prefix_text} типография");
+                let (mut control, control_sid) = r6_styled_prefix_doc(&separated, prefix_len, composer, balance, 400.0);
+                control.story_mut(control_sid).unwrap().format_chars(0..prefix_len, |f| f.over.language = Some("French".into()));
+                let start = prefix_len + 1;
+                r5_cached_hyphenation(&control, control_sid, &Cache::new(), &mut None, &[start + 4, start + 8, start + 14], &[]);
+
+                // Protect only the leading SHY marker(s), isolating the real in-word SHY.
+                let explicit = format!("{prefix_text}помни\u{ad}те");
+                let end = prefix_len + 12;
+                let make_doc = |measure| {
+                    let (mut d, sid) = r6_styled_prefix_doc(&explicit, prefix_len, composer, balance, measure);
+                    let story = d.story_mut(sid).unwrap();
+                    for (byte, ch) in prefix_text.char_indices() {
+                        if ch == shape::SOFT_HYPHEN {
+                            story.format_chars(byte..byte + 2, |f| f.over.no_break = Some(true));
+                        }
+                    }
+                    story.format_chars(end - 2..end, |f| {
+                        f.over.font_style = Some("SemiBold".into());
+                        f.over.size = Some(24.0);
+                    });
+                    r34_size_balanced_suffix(&mut d, sid, end);
+                    (d, sid)
+                };
+                let (wide, wide_sid) = make_doc(400.0);
+                let (glyphs, points) = automatic_hyphenation_glyphs(&wide, wide_sid);
+                r6_assert_prefix_ownership(&explicit, prefix_len, &glyphs);
+                assert!(points.iter().all(|p| !p));
+                let marker = glyphs.iter().find(|g| g.byte == end - 2 && g.len == 2).unwrap();
+                assert_eq!((marker.ch, marker.adv), (shape::SOFT_HYPHEN, 0.0));
+                let split = glyphs.iter().position(|g| g.byte >= end).unwrap();
+                let letter = glyphs.iter().find(|g| g.byte == prefix_len + 8 && g.len > 0).unwrap();
+                let hyphen = shape::hyphen_after(letter, end);
+                let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+                let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+                let measure = (prefix + hyphen.adv).max(suffix) + 0.25;
+                assert!(measure < prefix + suffix);
+                let (mut d, sid) = make_doc(measure);
+                let cache = Cache::new();
+                let mut previous = None;
+                let mut check = |d: &Document, permitted: bool| {
+                    let ends: Vec<_> = permitted.then_some(end).into_iter().collect();
+                    let cs = r5_cached_hyphenation(d, sid, &cache, &mut previous, &[], &ends);
+                    let lines = all_lines(&cs);
+                    if permitted {
+                        assert_eq!(lines.len(), 2);
+                        let line = lines.iter().find(|line| line.hyphenated).unwrap();
+                        assert_eq!(line.range, 0..end);
+                        let h = line.glyphs.last().unwrap();
+                        let placed_letter = line.glyphs.iter().find(|g| g.byte == prefix_len + 8 && g.len > 0).unwrap();
+                        assert_eq!((h.byte, h.len, h.face, h.gid), (end, 0, letter.face, hyphen.gid));
+                        assert_eq!((h.sx, h.sy, h.style), (placed_letter.sx, placed_letter.sy, placed_letter.style));
+                        assert!((line.end_x - line.x0 - prefix - hyphen.adv).abs() < 1e-6);
+                        assert!(line.end_x <= line.x1 + 1e-6);
+                    }
+                    assert_eq!(d.story(sid).unwrap().text.as_str(), explicit);
+                };
+                check(&d, true);
+                d.hyphenation_exceptions = vec![explicit.clone()];
+                check(&d, true);
+                d.hyphenation_exceptions = vec![format!("{prefix_text}по~мни\u{ad}те")];
+                check(&d, true);
+                d.story_mut(sid).unwrap().format_chars(0..prefix_len, |f| f.over.language = Some("French".into()));
+                check(&d, true);
+                d.story_mut(sid).unwrap().format_chars(0..prefix_len, |f| f.over.language = Some("Russian".into()));
+                check(&d, true);
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(false);
+                check(&d, true);
+                d.story_mut(sid).unwrap().format_chars(end - 2..end, |f| f.over.no_break = Some(true));
+                check(&d, false);
+                d.story_mut(sid).unwrap().format_chars(end - 2..end, |f| f.over.no_break = Some(false));
+                check(&d, true);
+                d.story_mut(sid).unwrap().format_chars(0..prefix_len, |f| f.over.no_break = Some(true));
+                check(&d, true);
+                d.story_mut(sid).unwrap().format_chars(0..explicit.len(), |f| f.over.no_break = Some(true));
+                check(&d, false);
+            }
+        }
+    }
+}
+
+#[test]
+fn r5_prebreak_joiners_and_soft_markers_use_letter_typography_in_all_composers() {
+    for joiner in ['\u{200C}', '\u{200D}'] {
+        for explicit in [false, true] {
+            let text = format!("помни{joiner}{}те", if explicit { "\u{ad}" } else { "" });
+            let allowed = format!("помни{joiner}~те");
+            let inside = format!("помни~{joiner}те");
+            let end = if explicit { 15 } else { 13 };
+            for (composer, balance) in [(Composer::Paragraph, false), (Composer::Paragraph, true), (Composer::SingleLine, false)] {
+                let make_doc = |measure| {
+                    let (mut d, sid) = styled_russian_mark_doc(&text, 10..13, composer, measure);
+                    d.story_mut(sid).unwrap().format_chars(10..13, |f| {
+                        f.over.font_style = Some("Medium".into());
+                        f.over.size = Some(30.0);
+                    });
+                    if explicit {
+                        d.story_mut(sid).unwrap().format_chars(13..15, |f| {
+                            f.over.font_style = Some("SemiBold".into());
+                            f.over.size = Some(24.0);
+                        });
+                    } else {
+                        d.hyphenation_exceptions = vec![allowed.clone()];
+                    }
+                    d.story_mut(sid).unwrap().paras[0].para.balance_ragged = Some(balance);
+                    r34_size_balanced_suffix(&mut d, sid, end);
+                    (d, sid)
+                };
+                let (wide, wide_sid) = make_doc(400.0);
+                let (glyphs, _) = automatic_hyphenation_glyphs(&wide, wide_sid);
+                let split = glyphs.iter().position(|g| g.byte >= end).unwrap();
+                let letter = glyphs.iter().find(|g| g.byte == 8 && g.len > 0).unwrap();
+                let control = glyphs.iter().find(|g| g.byte == 10 && g.len == 3).unwrap();
+                assert_eq!(control.ch, joiner, "the pre-break joiner owns its bytes");
+                assert_eq!(control.size, 30.0);
+                assert_eq!((letter.ch, letter.size), ('и', 12.0));
+                assert_ne!(control.face, letter.face);
+                if explicit {
+                    let marker = glyphs.iter().find(|g| g.byte == 13 && g.len == 2).unwrap();
+                    assert_eq!((marker.ch, marker.adv), (shape::SOFT_HYPHEN, 0.0));
+                    assert_ne!(marker.face, letter.face);
+                }
+                assert_eq!(shape::hyphen_base(&glyphs[..split]).unwrap().byte, 8, "choose the letter, not a joiner or SHY");
+                let hyphen = shape::hyphen_after(letter, end);
+                let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+                let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+                let measure = (prefix + hyphen.adv).max(suffix) + 0.25;
+                assert!(measure < prefix + suffix);
+                assert!(prefix + shape::hyphen_after(control, end).adv > measure, "the wrong joiner-based hyphen cannot fit");
+                let candidate = Break { start: 0, end: split, next: split, hyphen: true, forced: false };
+                assert!((breaker::line_width(&glyphs, &candidate) - prefix - hyphen.adv).abs() < 1e-6);
+                let (mut d, sid) = make_doc(measure);
+                let cache = Cache::new();
+                let mut previous = None;
+                let expected_points = if explicit { vec![] } else { vec![end] };
+                let explicit_end = explicit.then_some(end);
+                let mut check = |d: &Document, points: &[usize], expected_end: Option<usize>| {
+                    let ends: Vec<_> = expected_end.into_iter().collect();
+                    let cs = r5_cached_hyphenation(d, sid, &cache, &mut previous, points, &ends);
+                    let lines = all_lines(&cs);
+                    assert_eq!(lines.iter().flat_map(|line| &line.glyphs).filter(|g| g.byte == 10 && g.len == 3).count(), 1);
+                    if expected_end.is_some() {
+                        let line = lines.iter().find(|line| line.hyphenated).unwrap();
+                        assert_eq!(line.range, 0..end);
+                        let placed = line.glyphs.last().unwrap();
+                        let placed_letter = line.glyphs.iter().find(|g| g.byte == 8 && g.len > 0).unwrap();
+                        assert_eq!((placed.byte, placed.len), (end, 0));
+                        assert_eq!((placed.face, placed.gid), (letter.face, hyphen.gid));
+                        assert_eq!((placed.sx, placed.sy, placed.style), (placed_letter.sx, placed_letter.sy, placed_letter.style));
+                        assert!((placed.adv - hyphen.adv).abs() < 1e-6);
+                        assert!((line.end_x - line.x0 - prefix - hyphen.adv).abs() < 1e-6);
+                        assert!(line.end_x <= line.x1 + 1e-6);
+                    }
+                    assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+                };
+                check(&d, &expected_points, Some(end));
+                d.story_mut(sid).unwrap().format_chars(10..13, |f| {
+                    f.over.font_style = Some("SemiBold".into());
+                    f.over.size = Some(18.0);
+                });
+                check(&d, &expected_points, Some(end));
+                d.story_mut(sid).unwrap().format_chars(10..13, |f| f.over.language = Some("French".into()));
+                check(&d, &[], explicit_end);
+                d.story_mut(sid).unwrap().format_chars(10..13, |f| f.over.language = Some("Russian".into()));
+                check(&d, &expected_points, Some(end));
+                d.hyphenation_exceptions = vec![text.clone()];
+                check(&d, &[], explicit_end);
+                d.hyphenation_exceptions = vec![inside.clone()];
+                check(&d, &[], explicit_end);
+                d.hyphenation_exceptions.clear();
+                check(&d, &[], explicit_end);
+                d.hyphenation_exceptions = vec![allowed.clone()];
+                check(&d, &expected_points, Some(end));
+                // A joiner's No Break gates its automatic endpoint; SHY has its own marker gate.
+                d.story_mut(sid).unwrap().format_chars(10..13, |f| f.over.no_break = Some(true));
+                check(&d, &[], explicit_end);
+                d.story_mut(sid).unwrap().format_chars(10..end, |f| f.over.no_break = Some(true));
+                check(&d, &[], None);
+                d.story_mut(sid).unwrap().format_chars(10..end, |f| f.over.no_break = Some(false));
+                check(&d, &expected_points, Some(end));
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(false);
+                check(&d, &[], explicit_end);
+                d.story_mut(sid).unwrap().paras[0].para.hyphenate = Some(true);
+                check(&d, &expected_points, Some(end));
+                d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(true));
+                check(&d, &[], None);
+                d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.no_break = Some(false));
+                check(&d, &expected_points, Some(end));
+            }
+        }
+    }
+}
+
+#[test]
+fn separately_styled_joiners_keep_full_russian_lookup_and_exceptions_in_both_composers() {
+    for joiner in ['\u{200C}', '\u{200D}'] {
+        let text = format!("за{joiner}помните");
+        let allowed = format!("за{joiner}помни~те");
+        let inside_grapheme = format!("за~{joiner}помните");
+        assert!(hyphen::hyphen_points_in(&text, &hyphen::Limits::default(), hyphen::Lang::Russian).is_empty());
+        for composer in [Composer::Paragraph, Composer::SingleLine] {
+            // Warm the suffix separately: it must not become the lookup key for the full word.
+            let (suffix_doc, suffix_sid) = styled_russian_mark_doc("помните", 0..0, composer, 400.0);
+            assert_eq!(automatic_hyphenation_bytes(&suffix_doc, suffix_sid), vec![10]);
+            let (d, sid) = styled_russian_mark_doc(&text, 4..7, composer, 400.0);
+            let (glyphs, _) = automatic_hyphenation_glyphs(&d, sid);
+            let joiner_glyph = glyphs.iter().find(|g| g.byte == 4 && g.len == 3).unwrap();
+            assert_eq!(joiner_glyph.ch, joiner, "exercise a separately styled, byte-owning joiner");
+            assert_eq!(joiner_glyph.size, 13.0);
+            let split = glyphs.iter().position(|g| g.byte >= 17).unwrap();
+            let letter = glyphs.iter().find(|g| g.byte == 15 && g.len > 0).unwrap();
+            assert_eq!(letter.ch, 'и');
+            let hyphen = shape::hyphen_after(letter, 17);
+            let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+            let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+            let measure = (prefix + hyphen.adv).max(suffix) + 0.25;
+            assert!(measure < prefix + suffix, "make a suffix-only lookup observable");
+            let (mut d, sid) = styled_russian_mark_doc(&text, 4..7, composer, measure);
+            let cache = Cache::new();
+            let mut previous = None;
+            for (exception, expected) in [
+                (None, None),
+                (Some(text.as_str()), None),
+                (Some(allowed.as_str()), Some(17)),
+                (Some(inside_grapheme.as_str()), None),
+                (Some(text.as_str()), None),
+                (None, None),
+            ] {
+                d.hyphenation_exceptions = exception.into_iter().map(str::to_string).collect();
+                let expected: Vec<_> = expected.into_iter().collect();
+                for _ in 0..2 {
+                    assert_eq!(automatic_hyphenation_bytes(&d, sid), expected, "{composer:?}: {joiner:?}, {exception:?}");
+                }
+                let cold = cache.get(&d, sid, None);
+                let warm = cache.get(&d, sid, None);
+                assert!(Arc::ptr_eq(&cold, &warm));
+                if let Some(previous) = previous {
+                    assert!(!Arc::ptr_eq(&cold, &previous), "full-source exception changes invalidate the composition");
+                }
+                assert!(!cold.is_overset(), "{composer:?}: {joiner:?}, {exception:?}");
+                let lines = all_lines(&cold);
+                let ends: Vec<_> = lines.iter().filter(|line| line.hyphenated).map(|line| line.range.end).collect();
+                assert_eq!(ends, expected, "{composer:?}: reject the full invalid word unless explicitly overridden");
+                for line in &lines {
+                    assert_hyphenation_cluster_anchors(line);
+                    if line.hyphenated {
+                        let placed = line.glyphs.last().unwrap();
+                        assert_eq!((placed.byte, placed.len), (17, 0));
+                        assert_eq!((placed.face, placed.gid), (letter.face, hyphen.gid));
+                        assert_eq!((placed.sx, placed.sy), (letter.sx, letter.sy));
+                        assert!((line.end_x - line.x0 - prefix - hyphen.adv).abs() < 1e-6);
+                    }
+                }
+                assert_eq!(lines.first().unwrap().range.start, 0);
+                assert_eq!(lines.last().unwrap().range.end, text.len());
+                assert_eq!(lines.iter().flat_map(|line| &line.glyphs).filter(|g| g.byte == 4 && g.len == 3).count(), 1);
+                assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+                previous = Some(cold);
+            }
+        }
+    }
+}
+
+#[test]
+fn balanced_line_width_matches_placed_letter_hyphens_in_both_composers() {
+    for (text, styled, end, letter_byte, exception) in
+        [("бере\u{0308}за", 8..10, 10, 6, Some("бере\u{0308}~за")), ("помни\u{0301}\u{ad}те", 10..14, 14, 8, None)]
+    {
+        for composer in [Composer::Paragraph, Composer::SingleLine] {
+            let make_doc = |measure| {
+                let (mut d, sid) = styled_russian_mark_doc(text, styled.clone(), composer, measure);
+                d.story_mut(sid).unwrap().format_chars(styled.clone(), |f| {
+                    f.over.font_style = Some("Medium".into());
+                    f.over.size = Some(30.0);
+                });
+                d.story_mut(sid).unwrap().paras[0].para.balance_ragged = Some(true);
+                d.hyphenation_exceptions = exception.into_iter().map(str::to_string).collect();
+                r34_size_balanced_suffix(&mut d, sid, end);
+                (d, sid)
+            };
+            let (d, sid) = make_doc(400.0);
+            let (glyphs, points) = automatic_hyphenation_glyphs(&d, sid);
+            let expected_points = if exception.is_some() { vec![end] } else { vec![] };
+            assert_eq!(automatic_hyphenation_bytes(&d, sid), expected_points);
+            assert_eq!(points.iter().any(|&p| p), exception.is_some());
+            let split = glyphs.iter().position(|g| g.byte >= end).unwrap();
+            let letter = glyphs.iter().find(|g| g.byte == letter_byte && g.len > 0).unwrap();
+            assert_eq!(letter.size, 12.0);
+            assert_eq!(glyphs[split - 1].size, 30.0);
+            assert_ne!(glyphs[split - 1].face, letter.face);
+            let hyphen = shape::hyphen_after(letter, end);
+            let prefix: f64 = glyphs[..split].iter().map(|g| g.adv).sum();
+            let suffix: f64 = glyphs[split..].iter().map(|g| g.adv).sum();
+            let candidate = Break { start: 0, end: split, next: split, hyphen: true, forced: false };
+            let measured = breaker::line_width(&glyphs, &candidate);
+            assert!((measured - prefix - hyphen.adv).abs() < 1e-6, "measure the letter's actual hyphen, not the 30-point mark or marker");
+            let measure = (prefix + hyphen.adv).max(suffix) + 0.25;
+            assert!(measure < prefix + suffix);
+            assert!(prefix + glyphs[split - 1].size * 0.33 > measure, "the previous estimate rejects this fitting candidate");
+            assert!(measured <= measure);
+            let unhyphenated = Break { hyphen: false, ..candidate };
+            assert!((breaker::line_width(&glyphs, &unhyphenated) - prefix).abs() < 1e-6);
+
+            let (d, sid) = make_doc(measure);
+            let cache = Cache::new();
+            let cold = cache.get(&d, sid, None);
+            let warm = cache.get(&d, sid, None);
+            assert!(Arc::ptr_eq(&cold, &warm));
+            assert!(!cold.is_overset(), "{composer:?}: {text}");
+            let lines = all_lines(&cold);
+            let first = lines.first().unwrap();
+            assert!(
+                first.hyphenated,
+                "{composer:?} balance=true text={text:?} end={end} measure={measure}: the letter-based candidate fits; lines={:?}",
+                lines.iter().map(|line| (&line.range, line.hyphenated)).collect::<Vec<_>>()
+            );
+            assert_eq!(first.range, 0..end);
+            let placed = first.glyphs.last().unwrap();
+            assert_eq!((placed.byte, placed.len), (end, 0));
+            assert_eq!((placed.face, placed.gid), (letter.face, hyphen.gid));
+            assert_eq!((placed.sx, placed.sy), (letter.sx, letter.sy));
+            assert!((first.end_x - first.x0 - measured).abs() < 1e-6, "balancing's natural width equals the rendered width");
+            assert!(first.end_x <= first.x1);
+            for line in &lines {
+                assert_hyphenation_cluster_anchors(line);
+            }
+            assert_eq!(lines.last().unwrap().range.end, text.len());
+            assert_eq!(d.story(sid).unwrap().text.as_str(), text);
+        }
+    }
+}
+
 #[test]
 fn spanish_text_gets_spanish_hyphenation() {
     let text = "La transición democrática fue una construcción colectiva extraordinariamente compleja y desesperadamente necesaria.";
@@ -1385,6 +2964,51 @@ fn cjk_aki_adds_space_without_scaling_outlines() {
     assert!((b.end_x - a.end_x - 18.0).abs() < 1e-6);
     assert_eq!(a.glyphs[0].sx, b.glyphs[0].sx);
     assert!((b.glyphs[0].x - a.glyphs[0].x - 3.0).abs() < 1e-6);
+}
+
+#[test]
+fn single_line_jidori_soft_hyphen_keeps_its_advance() {
+    let prefix = "prefix prefix ";
+    let text = format!("{prefix}ab\u{ad}cd");
+    let make_doc = |measure| {
+        let (mut d, sid, _) = doc_with(
+            &text,
+            Rect::new(0.0, 0.0, measure, 300.0),
+            ParaAttrs { composer: Some(Composer::SingleLine), align: Some(Align::Left), hyphenate: Some(false), ..Default::default() },
+        );
+        let story = d.story_mut(sid).unwrap();
+        story.format_chars(0..text.len(), |f| {
+            f.over.font_family = Some("Inter".into());
+            f.over.font_style = Some("Regular".into());
+            f.over.size = Some(12.0);
+        });
+        story.format_chars(prefix.len()..text.len(), |f| f.over.jidori = Some(10));
+        (d, sid)
+    };
+    let (wide, sid) = make_doc(400.0);
+    let (glyphs, points) = automatic_hyphenation_glyphs(&wide, sid);
+    assert!(points.iter().all(|p| !p));
+    let group = glyphs.iter().position(|g| g.byte == prefix.len()).unwrap();
+    let before: f64 = glyphs[..group].iter().map(|g| g.adv).sum();
+    let target: f64 = glyphs[group..].iter().map(|g| g.adv).sum();
+    let shy = glyphs[group..].iter().find(|g| g.ch == shape::SOFT_HYPHEN).unwrap();
+    assert!(shy.adv > 0.1, "actual Jidori shaping gives SHY a positive gap");
+    assert_eq!(shy.break_after, Some(false));
+    assert!((target - 120.0).abs() < 1e-6);
+    // The whole group fits alone. Dropping SHY's gap incorrectly makes it fit after the prefix.
+    let measure = before + target - shy.adv * 0.5;
+    assert!(target < measure && measure < before + target);
+    assert!(before + target - shy.adv < measure);
+    let (d, sid) = make_doc(measure);
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    assert!(!cs.is_overset());
+    let lines = all_lines(&cs);
+    assert_eq!(lines.len(), 2, "wrap at the space before the indivisible Jidori group");
+    assert_eq!(lines[0].range, 0..prefix.len());
+    assert_eq!(lines[1].range, prefix.len()..text.len());
+    assert!(lines.iter().all(|line| !line.hyphenated));
+    assert!(lines.iter().all(|line| line.end_x <= line.x1 + 1e-6));
+    assert!((lines[1].end_x - lines[1].x0 - target).abs() < 1e-6, "retain the full Jidori target width");
 }
 
 #[test]

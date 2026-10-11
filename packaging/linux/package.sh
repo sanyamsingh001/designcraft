@@ -102,6 +102,9 @@ if has appimage; then
   APPDIR="$WORK/DesignCraft.AppDir"
   cp -R "$STAGE" "$APPDIR"
   mv "$APPDIR/usr/share/doc" "$WORK/doc-unused"
+  # Retain mandatory hyphenation source/license docs while omitting the font docs as before.
+  mkdir -p "$APPDIR/usr/share/doc/designcraft"
+  cp -R "$STAGE/usr/share/doc/designcraft/hyphenation" "$APPDIR/usr/share/doc/designcraft/"
   ln -s usr/bin/designcraft "$APPDIR/AppRun"
   cp "$HERE/$APP_ID.desktop" "$APPDIR/$APP_ID.desktop"
   cp "$ROOT/assets/app-icon/hicolor/256x256/apps/$APP_ID.png" "$APPDIR/$APP_ID.png"

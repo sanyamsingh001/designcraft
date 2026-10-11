@@ -46,6 +46,9 @@ modules:
     build-commands:
       - cargo --offline build --release --locked -p designcraft
       - install -Dm755 target/release/designcraft /app/bin/designcraft
+      - install -Dm644 crates/compose/src/hyphen/hyph-ru.tex /app/share/doc/designcraft/hyphenation/hyph-ru.tex
+      - install -Dm644 crates/compose/src/hyphen/LPPL-1.3c.txt /app/share/doc/designcraft/hyphenation/LPPL-1.3c.txt
+      - install -Dm644 crates/compose/src/hyphen/README.md /app/share/doc/designcraft/hyphenation/README.md
       - install -Dm644 packaging/linux/ai.storyteller.designcraft.desktop /app/share/applications/ai.storyteller.designcraft.desktop
       - install -Dm644 packaging/linux/ai.storyteller.designcraft.mime.xml /app/share/mime/packages/ai.storyteller.designcraft.xml
       - mkdir -p /app/share/icons && cp -R assets/app-icon/hicolor /app/share/icons/

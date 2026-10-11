@@ -53,10 +53,20 @@ copy_docs() {
   copy_font_licences "$dest"
 }
 
+# Ship the unmodified Russian hyphenation source, license and provenance beside package docs.
+# These are mandatory even in builds without the optional craft-fonts input.
+copy_hyphenation_docs() {
+  local dest="$1/hyphenation" source="$ROOT/crates/compose/src/hyphen"
+  mkdir -p "$dest"
+  cp "$source/hyph-ru.tex" "$source/LPPL-1.3c.txt" "$source/README.md" "$dest/"
+}
+
 # Builds made with craft-fonts (CRAFT_FONTS_DIR, set by the release workflow) embed its fonts, so
-# the package carries their licences as OFL-<family-dir>.txt. Nothing without CRAFT_FONTS_DIR.
+# the package carries their licences as OFL-<family-dir>.txt. No font files without CRAFT_FONTS_DIR.
 copy_font_licences() {
   local dest="$1" f
+  # The app bundle calls this helper directly; every caller also embeds hyphenation data.
+  copy_hyphenation_docs "$dest" || return
   [ -n "${CRAFT_FONTS_DIR:-}" ] || return 0
   for f in "$CRAFT_FONTS_DIR"/fonts/*/OFL.txt; do
     if [ -f "$f" ]; then cp "$f" "$dest/OFL-$(basename "$(dirname "$f")").txt"; fi

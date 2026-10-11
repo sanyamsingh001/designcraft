@@ -92,12 +92,12 @@ pub struct Patterns {
 }
 
 impl Patterns {
-    /// Parse TeX-style patterns: whitespace-separated, `%`/`#` start a comment line.
+    /// Parse TeX-style patterns: whitespace-separated, `%`/`#` start a comment.
     pub fn parse(text: &str) -> Patterns {
         let mut p = Patterns::default();
         for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('%') || line.starts_with('#') {
+            let line = line.split(['%', '#']).next().unwrap_or("").trim();
+            if line.is_empty() {
                 continue;
             }
             for tok in line.split_whitespace() {
@@ -224,6 +224,16 @@ pub fn apply(map: &FxMap<u64, Box<[u8]>>, max_len: usize, codes: &[u8], vals: &m
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_patterns_and_inline_comments() {
+        let p = Patterns::parse("мо1ло % ignore this comment\nло1ко # and this one\n% full line\n");
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.points(&"молоко".chars().collect::<Vec<_>>()), Some(vec![2, 4]));
+        assert!(p.points(&"молoко".chars().collect::<Vec<_>>()).is_none());
+        let q = Patterns::parse(&p.to_tex().join("\n"));
+        assert_eq!(q.points(&"молоко".chars().collect::<Vec<_>>()), Some(vec![2, 4]));
+    }
 
     #[test]
     fn liang_example() {

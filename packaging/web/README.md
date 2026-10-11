@@ -9,8 +9,12 @@ static site in `designcraft-web-<version>/`:
 | `designcraft-web-<hash>.js` | wasm-bindgen glue (generated, ES module) |
 | `designcraft-web-<hash>_bg.wasm` | The app, about 13 MB, or 5 MB with compression |
 | `_headers`, `.htaccess` | Sample header rules for Netlify/Cloudflare Pages and Apache |
+| `hyphenation/` | Unmodified Russian patterns (`hyph-ru.tex`), their license (`LPPL-1.3c.txt`), and source attribution (`README.md`) |
 
 There is no server-side code. Upload the folder's contents anywhere that serves static files.
+Keep the `hyphenation/` directory available with the app; it provides the source and license
+for the Russian data embedded in the WASM binary. Raw `trunk build` and `trunk serve`
+outputs include the same files, so this also applies when publishing `dist/web` directly.
 
 ## Any path works
 

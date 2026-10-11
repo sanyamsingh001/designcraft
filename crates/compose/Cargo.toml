@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 unicode-bidi = { workspace = true }
 unicode-bidi-mirroring = { workspace = true }
+unicode-normalization = "0.1"
+unicode-segmentation = { workspace = true }
 designcraft-geom = { workspace = true }
 designcraft-color = { workspace = true }
 designcraft-doc = { workspace = true }

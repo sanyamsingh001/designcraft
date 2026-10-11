@@ -82,9 +82,12 @@ by its own renderer. Try it yourself with `File → New → Sample Document`, or
   frames and threaded stories, the Control panel, paragraph and character styles, swatches, text
   wrap and more. If you know InDesign, you already know how to use it.
 - **Beautiful type.** A Knuth–Plass paragraph composer (plus single-line), dictionary hyphenation
-  (the public-domain Moby word list plus our own trained patterns), word, letter and glyph-scaling
-  justification, keeps, optical margin alignment, columns, baseline grid, tabs, rules and shading.
-  Line breaks are identical on screen and in PDF.
+  for US English (the public-domain Moby word list plus our own trained patterns), Spanish
+  (Javier Bezos's patterns) and Russian (published patterns and exceptions), word, letter and
+  glyph-scaling justification, keeps, optical margin alignment, columns, baseline grid,
+  tabs, rules and shading.
+  Other languages, including Turkish, currently have no automatic hyphenation; discretionary
+  hyphens remain available. Line breaks are identical on screen and in PDF.
 - **Fast.** Multithreaded SIMD rendering (vello_cpu), copy-on-write documents with O(1) undo
   snapshots, and cached composition.
 - **Open.** A documented native format, IDML import and export, and PNG, PDF (PDF/X-4, PDF/A-2b)
@@ -280,6 +283,22 @@ Copyright (c) 2026 ArtCraft Team and the DesignCraft contributors. Required noti
 
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ASSETS.md](ASSETS.md).
+
+Russian hyphenation data is by Alexander I. Lebedev, copyright 1999-2003, under LPPL 1.2 or
+later (distributed under [LPPL 1.3c](https://www.latex-project.org/lppl/lppl-1-3c.txt)). Its
+[unmodified source](https://raw.githubusercontent.com/hyphenation/tex-hyphen/5684c0f51c0b81133db2efbe60a408b4155a3ff5/hyph-utf8/tex/generic/hyph-utf8/patterns/tex/hyph-ru.tex)
+is available at revision `5684c0f51c0b81133db2efbe60a408b4155a3ff5`.
+The complete original four-file work can be obtained from
+[CTAN ruhyphen](https://mirrors.ctan.org/language/hyphenation/ruhyphen.zip),
+[package information](https://ctan.org/pkg/ruhyphen).
+The source SHA-256 is `ce988fcc66e5e29d7474df5ab5b489d3f52a50ebccf570997f992d84221b922a`.
+Packages using the shared license helper include these files and provenance in `hyphenation/`
+next to their other license files; the source-built Flatpak uses
+`/app/share/doc/designcraft/hyphenation/`. Raw Trunk output includes the same
+source and license files. Every release includes `designcraft-hyphenation-source.zip`
+beside **all** distribution formats, with the source, license, notices and integration
+source. Release notes link to that archive and the matching full DesignCraft source.
+Keep those source downloads and notices available when redistributing or mirroring binaries.
 
 The bundled fonts, and the craft-fonts fonts embedded by release builds, are under the SIL Open
 Font License; all UI icons are drawn in code and are original.

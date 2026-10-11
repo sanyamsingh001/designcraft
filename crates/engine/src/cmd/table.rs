@@ -1758,3 +1758,7 @@ mod arabic_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "table_interchange_tests.rs"]
+mod interchange_tests;

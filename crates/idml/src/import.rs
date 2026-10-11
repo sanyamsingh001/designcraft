@@ -112,6 +112,7 @@ struct Importer<'r> {
     condition_names: HashMap<String, String>,
     inks: designcraft_doc::InkManager,
     stroke_styles: Vec<designcraft_doc::StrokeStyleDef>,
+    table_dash_patterns: HashMap<String, Vec<f64>>,
     styles: Styles,
     kinsoku: HashMap<String, designcraft_doc::cjk::Kinsoku>,
     para_names: HashMap<String, String>,
@@ -198,6 +199,7 @@ impl<'r> Importer<'r> {
             condition_names: HashMap::new(),
             inks: Default::default(),
             stroke_styles: Vec::new(),
+            table_dash_patterns: HashMap::new(),
             styles,
             kinsoku: HashMap::new(),
             para_names: HashMap::new(),
@@ -607,7 +609,16 @@ impl<'r> Importer<'r> {
                 "DashedStrokeStyle" => designcraft_doc::StrokeType::Dashed { pattern: nums("DashArray") },
                 _ => designcraft_doc::StrokeType::Dotted,
             };
-            let _ = id;
+            // Only the complete generated identity is a concrete table dash resource.
+            // User-named custom styles keep their existing Style { name } representation.
+            if let designcraft_doc::StrokeType::Dashed { pattern } = &kind
+                && !pattern.is_empty()
+                && id == names::table_dash_style_id(pattern)
+                && name == id
+            {
+                self.table_dash_patterns.insert(id.to_string(), pattern.clone());
+                continue;
+            }
             self.stroke_styles.push(designcraft_doc::StrokeStyleDef { name: name.to_string(), kind });
         }
         // Ink Manager.
@@ -1421,12 +1432,19 @@ impl<'r> Importer<'r> {
             .unwrap_or_else(|| names::style_name_in(names::TABLE_BUILTINS, &unescape_id(reference.trim_start_matches("TableStyle/"))))
     }
 
+    fn table_stroke_type(&self, reference: &str) -> designcraft_doc::StrokeType {
+        self.table_dash_patterns
+            .get(reference)
+            .map(|pattern| designcraft_doc::StrokeType::Dashed { pattern: pattern.clone() })
+            .unwrap_or_else(|| names::stroke_type_in(reference))
+    }
+
     fn cell_stroke_attrs(&mut self, el: &El, prefix: &str) -> designcraft_doc::CellStrokeAttrs {
         designcraft_doc::CellStrokeAttrs {
             weight: el.num(&format!("{prefix}StrokeWeight")).map(|v| v.max(0.0)),
             color: el.prop(&format!("{prefix}StrokeColor")).map(|v| self.swatch_ref(&v)),
             tint: tint(el.num(&format!("{prefix}StrokeTint"))),
-            kind: el.prop(&format!("{prefix}StrokeType")).map(|v| names::stroke_type_in(&v)),
+            kind: el.prop(&format!("{prefix}StrokeType")).map(|v| self.table_stroke_type(&v)),
         }
     }
 
@@ -1450,7 +1468,7 @@ impl<'r> Importer<'r> {
         if kind == "Column"
             && let Some(value) = el.prop("EndColumnLineStyle")
         {
-            next_stroke.kind = Some(names::stroke_type_in(&value));
+            next_stroke.kind = Some(self.table_stroke_type(&value));
         }
         designcraft_doc::AltStrokesAttrs {
             first: el.num(&format!("Start{kind}StrokeCount")).map(|v| v.max(0.0) as u32),

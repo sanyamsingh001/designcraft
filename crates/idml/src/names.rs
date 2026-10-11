@@ -254,6 +254,13 @@ pub fn join_in(s: &str) -> Join {
     }
 }
 
+/// Reserved resource identities for concrete table dash arrays; user-named styles use
+/// `CustomStrokeStyle/` instead. Float bits distinguish patterns without rounding them.
+pub fn table_dash_style_id(pattern: &[f64]) -> String {
+    let bits = pattern.iter().map(|v| format!("{:016x}", v.to_bits())).collect::<Vec<_>>().join("-");
+    format!("DesignCraftTableDash/{bits}")
+}
+
 /// Stroke style Self ids for our stroke types (built-in InDesign stroke styles).
 pub fn stroke_type_out(t: &StrokeType) -> String {
     let s = match t {

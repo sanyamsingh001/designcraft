@@ -136,6 +136,8 @@ struct Ex<'a> {
     /// Index topics (paths) and their See / See also cross-references.
     index_topics: BTreeSet<Vec<String>>,
     index_xrefs: Vec<(Vec<String>, &'static str, String)>,
+    /// Concrete table dash arrays registered by stories and sparse style resources.
+    table_dash_patterns: BTreeMap<String, Vec<f64>>,
 }
 
 impl<'a> Ex<'a> {
@@ -150,6 +152,7 @@ impl<'a> Ex<'a> {
             xref_sources: Vec::new(),
             index_topics: BTreeSet::new(),
             index_xrefs: Vec::new(),
+            table_dash_patterns: BTreeMap::new(),
         };
         ex.assign_swatch_ids();
         for s in d.stories.values() {
@@ -648,6 +651,14 @@ impl<'a> Ex<'a> {
             if let Some(el) = el {
                 root.push(el.attr("Self", id).attr("Name", &st.name));
             }
+        }
+        for (id, pattern) in &self.table_dash_patterns {
+            root.push(
+                El::new("DashedStrokeStyle")
+                    .attr("Self", id)
+                    .attr("Name", id)
+                    .attr("DashArray", pattern.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")),
+            );
         }
         for s in STROKE_STYLES {
             root.push(El::new("StrokeStyle").attr("Self", format!("StrokeStyle/$ID/{s}")).attr("Name", format!("$ID/{s}")));
@@ -2187,14 +2198,26 @@ impl<'a> Ex<'a> {
         paras
     }
 
-    fn cell_stroke_attrs(&self, el: &mut El, prefix: &str, s: &designcraft_doc::CellStroke) {
+    fn table_stroke_type(&mut self, kind: &designcraft_doc::StrokeType) -> String {
+        if let designcraft_doc::StrokeType::Dashed { pattern } = kind
+            && !pattern.is_empty()
+        {
+            let id = names::table_dash_style_id(pattern);
+            self.table_dash_patterns.entry(id.clone()).or_insert_with(|| pattern.clone());
+            id
+        } else {
+            names::stroke_type_out(kind)
+        }
+    }
+
+    fn cell_stroke_attrs(&mut self, el: &mut El, prefix: &str, s: &designcraft_doc::CellStroke) {
         el.set(&format!("{prefix}StrokeWeight"), num(s.weight));
         el.set(&format!("{prefix}StrokeColor"), self.sw(&s.color));
         el.set(&format!("{prefix}StrokeTint"), pct(s.tint as f64));
-        el.set(&format!("{prefix}StrokeType"), names::stroke_type_out(&s.kind));
+        el.set(&format!("{prefix}StrokeType"), self.table_stroke_type(&s.kind));
     }
 
-    fn partial_cell_stroke_attrs(&self, el: &mut El, prefix: &str, attrs: &designcraft_doc::CellStrokeAttrs) {
+    fn partial_cell_stroke_attrs(&mut self, el: &mut El, prefix: &str, attrs: &designcraft_doc::CellStrokeAttrs) {
         if let Some(value) = attrs.weight {
             el.set(&format!("{prefix}StrokeWeight"), num(value));
         }
@@ -2205,7 +2228,7 @@ impl<'a> Ex<'a> {
             el.set(&format!("{prefix}StrokeTint"), pct(value as f64));
         }
         if let Some(value) = &attrs.kind {
-            el.set(&format!("{prefix}StrokeType"), names::stroke_type_out(value));
+            el.set(&format!("{prefix}StrokeType"), self.table_stroke_type(value));
         }
     }
 
@@ -2236,7 +2259,7 @@ impl<'a> Ex<'a> {
         }
     }
 
-    fn partial_alt_stroke_attrs(&self, el: &mut El, kind: &str, attrs: &designcraft_doc::AltStrokesAttrs) {
+    fn partial_alt_stroke_attrs(&mut self, el: &mut El, kind: &str, attrs: &designcraft_doc::AltStrokesAttrs) {
         if let Some(value) = attrs.first {
             el.set(&format!("Start{kind}StrokeCount"), value);
         }
@@ -2249,7 +2272,7 @@ impl<'a> Ex<'a> {
             && let Some(value) = &attrs.next_stroke.kind
         {
             el.attrs.retain(|(key, _)| key != "EndColumnStrokeType");
-            el.set("EndColumnLineStyle", names::stroke_type_out(value));
+            el.set("EndColumnLineStyle", self.table_stroke_type(value));
         }
         if let Some(value) = attrs.skip_first {
             el.set(&format!("SkipFirstAlternatingStroke{kind}s"), value);
@@ -2308,7 +2331,7 @@ impl<'a> Ex<'a> {
                 self.cell_stroke_attrs(&mut el, &format!("End{kind}"), &strokes.next_stroke);
                 if kind == "Column" {
                     el.attrs.retain(|(key, _)| key != "EndColumnStrokeType");
-                    el.set("EndColumnLineStyle", names::stroke_type_out(&strokes.next_stroke.kind));
+                    el.set("EndColumnLineStyle", self.table_stroke_type(&strokes.next_stroke.kind));
                 }
                 el.set(&format!("SkipFirstAlternatingStroke{kind}s"), strokes.skip_first);
                 el.set(&format!("SkipLastAlternatingStroke{kind}s"), strokes.skip_last);

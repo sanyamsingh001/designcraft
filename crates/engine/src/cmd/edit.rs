@@ -143,10 +143,26 @@ fn copy_objects_with_entropy(
     Ok(result)
 }
 
+const CHILD_PASTE_STRIPPED_MARKS: [char; 3] = [designcraft_doc::FOOTNOTE_REF, designcraft_doc::XREF_MARK, designcraft_doc::TABLE_ANCHOR];
+
+impl Session {
+    /// Whether an empty system string can insert retained formatted text at the current target.
+    /// Native hosts query this immediately before delivery; explicit empty Paste is unchanged.
+    pub fn has_usable_empty_text_clipboard(&self) -> bool {
+        let Some(state) = self.active() else { return false };
+        let Some(target) = state.selection.text else { return false };
+        if state.doc.text_story(target.story, target.cell).is_none() {
+            return false;
+        }
+        let Some((slice, plain)) = self.text_clipboard.as_ref() else { return false };
+        plain.is_empty()
+            && if target.cell.is_some() { slice.text.chars().any(|ch| !CHILD_PASTE_STRIPPED_MARKS.contains(&ch)) } else { !slice.text.is_empty() }
+    }
+}
+
 fn strip_objects(st: &designcraft_doc::Story) -> designcraft_doc::Story {
     let mut out = st.clone();
-    let marks = [designcraft_doc::FOOTNOTE_REF, designcraft_doc::XREF_MARK, designcraft_doc::TABLE_ANCHOR];
-    while let Some(i) = out.text.find(marks) {
+    while let Some(i) = out.text.find(CHILD_PASTE_STRIPPED_MARKS) {
         let n = out.text[i..].chars().next().map_or(1, char::len_utf8);
         out.delete(i..i + n);
     }
@@ -413,6 +429,84 @@ mod text_clipboard_tests {
         assert_eq!(s.execute("edit.cut", &json!({})).unwrap()["text"], "Bold");
         assert!(s.doc().unwrap().doc.story(b).unwrap().text.starts_with(" wordsTarget"));
         s.doc().unwrap().doc.check().unwrap();
+    }
+
+    #[test]
+    fn native_empty_rich_query_matches_child_stripping_and_retained_page_marker() {
+        use designcraft_doc::{FOOTNOTE_REF, PAGE_NUMBER, Story, TABLE_ANCHOR, XREF_MARK};
+
+        for note in [false, true] {
+            let mut s = Session::new();
+            s.execute("file.new", &json!({})).unwrap();
+            let sid = frame(&mut s, "OLD");
+            s.execute("text.select", &json!({"story": sid.0, "anchor": 3, "focus": 3})).unwrap();
+            if note {
+                s.execute("footnote.insert", &json!({"text": "CHILD"})).unwrap();
+            } else {
+                s.execute("table.insert", &json!({"rows": 1, "cols": 1, "width": 160})).unwrap();
+                s.execute("text.insert", &json!({"text": "CHILD", "raw": true})).unwrap();
+            }
+            s.execute("text.move", &json!({"dir": "storyStart"})).unwrap();
+            s.execute("text.move", &json!({"dir": "storyEnd", "extend": true})).unwrap();
+            let child = s.doc().unwrap().selection.text.unwrap();
+            assert!(child.cell.is_some());
+            let before = s.doc().unwrap().clone();
+            let journal = s.journal.clone();
+            // Synthetic slices isolate the exact character-removal policy; the native
+            // delivery tests below exercise a real copied footnote and its payload.
+            for text in [
+                String::new(),
+                FOOTNOTE_REF.to_string(),
+                XREF_MARK.to_string(),
+                TABLE_ANCHOR.to_string(),
+                format!("{FOOTNOTE_REF}{XREF_MARK}{TABLE_ANCHOR}"),
+                PAGE_NUMBER.to_string(),
+                format!("{FOOTNOTE_REF}{PAGE_NUMBER}{TABLE_ANCHOR}"),
+            ] {
+                let slice = Story::with_text(sid, &text, Default::default());
+                let expected = text.contains(PAGE_NUMBER);
+                assert_eq!(!strip_objects(&slice).text.is_empty(), expected);
+                s.text_clipboard = Some((Arc::new(slice), String::new()));
+                assert_eq!(s.has_usable_empty_text_clipboard(), expected, "{note} {text:?}");
+                assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+                assert_eq!(s.doc().unwrap().selection, before.selection);
+                assert_eq!(s.journal, journal);
+            }
+            // A retained marker is a real eligible child payload, not a blanket child rejection.
+            s.text_clipboard = Some((Arc::new(Story::with_text(sid, &PAGE_NUMBER.to_string(), Default::default())), String::new()));
+            let pasted = s.execute("edit.paste", &json!({"text": ""})).unwrap();
+            assert_eq!(pasted["formatted"], true);
+            assert_eq!(s.doc().unwrap().doc.text_story(sid, child.cell).unwrap().text, PAGE_NUMBER.to_string());
+            s.doc().unwrap().doc.check().unwrap();
+            s.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(*s.doc().unwrap().doc, *before.doc);
+        }
+    }
+
+    #[test]
+    fn native_empty_rich_query_requires_matching_payload_and_real_target() {
+        let mut s = Session::new();
+        assert!(!s.has_usable_empty_text_clipboard());
+        s.execute("file.new", &json!({})).unwrap();
+        let sid = frame(&mut s, "OLD");
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 1, "focus": 2})).unwrap();
+        assert!(!s.has_usable_empty_text_clipboard());
+        s.execute("edit.copy", &json!({})).unwrap();
+        assert!(!s.has_usable_empty_text_clipboard(), "ordinary copied text does not match an empty system string");
+        let before = s.doc().unwrap().doc.clone();
+        s.execute("edit.paste", &json!({"text": ""})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.story(sid).unwrap().text, "OD", "the explicit engine empty contract is unchanged");
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *before);
+        s.text_clipboard = Some((Arc::new(designcraft_doc::Story::new(sid)), String::new()));
+        assert!(!s.has_usable_empty_text_clipboard(), "an empty rich slice cannot authorize native deletion");
+        let slice = designcraft_doc::Story::with_text(sid, &designcraft_doc::PAGE_NUMBER.to_string(), Default::default());
+        s.text_clipboard = Some((Arc::new(slice), String::new()));
+        assert!(s.has_usable_empty_text_clipboard());
+        s.doc_mut().unwrap().selection.text.as_mut().unwrap().story = designcraft_doc::StoryId(u64::MAX);
+        assert!(!s.has_usable_empty_text_clipboard(), "a missing target is not eligible");
+        s.doc_mut().unwrap().selection.text = None;
+        assert!(!s.has_usable_empty_text_clipboard());
     }
 
     #[test]

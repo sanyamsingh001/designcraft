@@ -387,3 +387,405 @@ fn used_overset_condition_visibility_resumes_primary_growth() {
     assert_eq!(full_doc(&without_growth), full_doc(&expected));
     growth(&mut s, sid, Some(removed), &before, count);
 }
+
+#[test]
+fn r52_nonmatching_grep_condition_preserves_explicit_primary_page_removal() {
+    let (mut s, sid) = primary_chain(false);
+    assert!(s.prefs.smart_text_reflow);
+    let name = "Dormant";
+    let style = "Dormant GREP";
+    let pattern = "ZZZ_NEVER_PRESENT";
+    let color = [10, 20, 30];
+    s.execute("condition.new", &json!({"name": name, "color": color, "visible": true})).unwrap();
+    s.execute("style.character.create", &json!({"name": style, "chars": {"conditions": [name]}})).unwrap();
+    select_all(&mut s, sid);
+    s.execute("type.para", &json!({"attrs": {"grepStyles": [{"style": style, "pattern": pattern}]}})).unwrap();
+
+    let removed = remove_tail(&mut s, sid);
+    let before = doc(&s);
+    let old_story = before.stories.get(&sid).unwrap();
+    assert_eq!(before.conditions, vec![designcraft_doc::Condition { name: name.to_string(), color, visible: true }]);
+    assert!(
+        !regex::Regex::new(pattern).unwrap().is_match(&old_story.text),
+        "fixture: the GREP rule matches nowhere in the full story, including its overset tail"
+    );
+    for para in &old_story.paras {
+        let (props, base) = before.styles.resolve_para(para);
+        assert_eq!(props.grep_styles.len(), 1);
+        assert_eq!((props.grep_styles[0].style.as_str(), props.grep_styles[0].pattern.as_str()), (style, pattern));
+        assert!(base.conditions.is_empty(), "fixture: the paragraph does not apply the condition");
+        for (_, format) in old_story.runs() {
+            assert!(before.styles.resolve_char(&base, format).conditions.is_empty(), "fixture: no text run directly applies the condition");
+        }
+        let format = designcraft_doc::CharFormat { style: style.to_string(), ..Default::default() };
+        let referenced = before.styles.resolve_char(&base, &format);
+        assert_eq!(referenced.conditions, vec![name.to_string()], "fixture: only the nonmatching GREP style references this condition");
+    }
+    let reduced = fresh(&before, sid);
+    assert!(reduced.is_overset(), "fixture: an occupied tail was removed, leaving real overset");
+    same_composition(&reduced, &s.cache.get(&before, sid, None));
+
+    // The independent oracle changes one visibility bit; preview only verifies the public command's delta.
+    let mut expected = (*before).clone();
+    expected.conditions[0].visible = false;
+    let expected = Arc::new(expected);
+    assert!(expected.conditions_hide(&[name.to_string()]));
+    same_composition(&reduced, &fresh(&expected, sid));
+    let params = json!({"name": name, "visible": false});
+    let toggled = probe(&mut s, "condition.options", params.clone());
+    assert_eq!(*toggled, *expected, "the toggle itself must change only condition visibility");
+    assert_eq!(full_doc(&toggled), full_doc(&expected));
+    assert!(Arc::ptr_eq(old_story, toggled.stories.get(&sid).unwrap()));
+    assert!(Arc::ptr_eq(&before.styles, &toggled.styles));
+    same_composition(&reduced, &fresh(&toggled, sid));
+
+    let count = s.doc().unwrap().history.undo.len();
+    let journal = s.journal.len();
+    s.execute("condition.options", &params).unwrap();
+    assert_eq!(s.journal.len(), journal + 1, "one condition edit produces one journal entry");
+    assert_eq!(s.journal.last().unwrap(), &("condition.options".into(), params));
+    assert_eq!(
+        doc(&s).page_count(),
+        before.page_count(),
+        "defect oracle: a nonmatching GREP condition must not recreate intentionally removed primary pages"
+    );
+    preserved(&mut s, sid, removed, &before, &expected, count);
+}
+
+#[test]
+fn r52_matched_overset_grep_condition_resumes_primary_growth() {
+    let (mut s, sid) = primary_chain(false);
+    assert!(s.prefs.smart_text_reflow);
+    let name = "Used GREP tail";
+    let style = "R52 GREP";
+    let pattern = "R52_CONDITIONAL_GREP_TAIL";
+    let color = [10, 20, 30];
+    s.execute("condition.new", &json!({"name": name, "color": color, "visible": true})).unwrap();
+    s.execute("style.character.create", &json!({"name": style, "chars": {"conditions": [name]}})).unwrap();
+
+    let fitted = doc(&s);
+    let composed = fresh(&fitted, sid);
+    let last = *fitted.story(sid).unwrap().frames.last().unwrap();
+    let range = &composed.frame(last).unwrap().range;
+    assert!(range.end - range.start > 4 * WORDS.len(), "fixture: occupied last page has room for unconditioned text and the match");
+    let end = range.start + 2 * WORDS.len();
+    let start = end + 1;
+    s.execute("text.select", &json!({"story": sid.0, "anchor": end, "focus": fitted.story(sid).unwrap().len()})).unwrap();
+    s.execute("text.insert", &json!({"text": format!("\n{pattern}")})).unwrap();
+    select_all(&mut s, sid);
+    s.execute("type.para", &json!({"attrs": {"grepStyles": [{"style": style, "pattern": pattern}]}})).unwrap();
+    let match_range = start..start + pattern.len();
+    let visible_match =
+        |cs: &ComposedStory| cs.frames.iter().flat_map(|f| &f.lines).flat_map(|l| &l.glyphs).any(|g| g.visible && match_range.contains(&g.byte));
+    let shown = fresh(&doc(&s), sid);
+    assert!(!shown.is_overset(), "fixture: the actual matched text fits before capacity removal");
+    assert!(visible_match(&shown), "fixture: the visible GREP condition really draws matched text");
+    s.execute("condition.options", &json!({"name": name, "visible": false})).unwrap();
+    let hidden = fresh(&doc(&s), sid);
+    assert!(!hidden.is_overset());
+    assert!(!visible_match(&hidden), "fixture: the same GREP condition really hides the match");
+
+    let removed = remove_tail(&mut s, sid);
+    let before = doc(&s);
+    let old_story = before.stories.get(&sid).unwrap();
+    let matches: Vec<_> = regex::Regex::new(pattern).unwrap().find_iter(&old_story.text).map(|m| m.range()).collect();
+    assert_eq!(matches, vec![match_range.clone()], "fixture: exactly one nonempty GREP match at the asserted tail range");
+    for para in &old_story.paras {
+        let (props, base) = before.styles.resolve_para(para);
+        assert_eq!(props.grep_styles.len(), 1);
+        assert_eq!((props.grep_styles[0].style.as_str(), props.grep_styles[0].pattern.as_str()), (style, pattern));
+        assert!(base.conditions.is_empty(), "fixture: no paragraph applies the condition directly");
+        for (_, format) in old_story.runs() {
+            assert!(before.styles.resolve_char(&base, format).conditions.is_empty(), "fixture: no run applies the condition directly");
+        }
+        let format = designcraft_doc::CharFormat { style: style.to_string(), ..Default::default() };
+        assert_eq!(before.styles.resolve_char(&base, &format).conditions, vec![name.to_string()]);
+    }
+    assert_eq!(before.conditions, vec![designcraft_doc::Condition { name: name.to_string(), color, visible: false }]);
+    let reduced = fresh(&before, sid);
+    assert!(
+        reduced.overset_at.is_some_and(|at| at < end && at < match_range.start),
+        "fixture: unconditioned text oversets before the entire actual GREP match"
+    );
+    same_composition(&reduced, &s.cache.get(&before, sid, None));
+
+    // The independent expected Doc changes only visibility; the matching tail is not yet composed.
+    let mut expected = (*before).clone();
+    expected.conditions[0].visible = true;
+    let params = json!({"name": name, "visible": true});
+    let toggled = probe(&mut s, "condition.options", params.clone());
+    assert_eq!(*toggled, expected, "the public toggle itself changes only condition visibility");
+    assert_eq!(full_doc(&toggled), full_doc(&expected));
+    assert!(Arc::ptr_eq(old_story, toggled.stories.get(&sid).unwrap()));
+    assert!(Arc::ptr_eq(&before.styles, &toggled.styles));
+    let still_overset = fresh(&expected, sid);
+    assert!(still_overset.is_overset());
+    same_composition(&reduced, &still_overset);
+
+    let count = s.doc().unwrap().history.undo.len();
+    let journal = s.journal.len();
+    s.execute("condition.options", &params).unwrap();
+    let after = doc(&s);
+    assert!(after.page_count() > before.page_count(), "a condition on an actual overset GREP match must resume primary growth");
+    let added = after.page_count() - before.page_count();
+    let old_frames = old_story.frames.len();
+    let new_story = after.story(sid).unwrap();
+    assert_eq!(new_story.frames.len(), old_frames + added);
+    assert_eq!(new_story.rev, old_story.rev + added as u64, "each appended primary frame advances the thread revision once");
+    assert_eq!(&new_story.frames[..old_frames], &old_story.frames);
+    assert_eq!(after.spreads.len(), before.spreads.len() + added);
+    assert!(!after.settings.facing_pages);
+    for (sp, frame) in after.spreads[before.spreads.len()..].iter().zip(&new_story.frames[old_frames..]) {
+        assert_eq!(sp.pages.len(), 1);
+        assert_eq!(sp.items.len(), 1);
+        assert_eq!(sp.items[0].id, *frame);
+        assert_eq!(sp.items[0].text_frame().unwrap().story, sid);
+        assert_eq!(sp.items[0].bounds(), sp.pages[0].margin_rect());
+    }
+    assert!(after.next_id > before.next_id);
+    assert_eq!(s.journal.len(), journal + 1);
+    assert_eq!(s.journal.last().unwrap(), &("condition.options".into(), params));
+    assert!(visible_match(&fresh(&after, sid)), "the revealed GREP match must actually compose after growth");
+
+    // Account only for the structurally asserted new capacity, IDs and thread revisions.
+    let mut without_growth = (*after).clone();
+    without_growth.spreads.truncate(before.spreads.len());
+    for (sp, old) in without_growth.spreads.iter_mut().zip(&before.spreads) {
+        Arc::make_mut(sp).id = old.id;
+    }
+    let restored_story = Arc::make_mut(without_growth.stories.get_mut(&sid).unwrap());
+    restored_story.frames.truncate(old_frames);
+    restored_story.rev = old_story.rev;
+    without_growth.next_id = before.next_id;
+    assert_eq!(without_growth, expected, "apart from asserted capacity/IDs/revisions, only condition visibility may change");
+    assert_eq!(full_doc(&without_growth), full_doc(&expected));
+    growth(&mut s, sid, Some(removed), &before, count);
+}
+
+#[test]
+fn r53_fully_shadowed_grep_condition_preserves_explicit_primary_page_removal() {
+    let (mut s, sid) = primary_chain(false);
+    assert!(s.prefs.smart_text_reflow);
+    let name = "Dormant";
+    let style = "Dormant GREP";
+    let cover = "Cover";
+    let pattern = "Words";
+    let color = [10, 20, 30];
+    s.execute("condition.new", &json!({"name": name, "color": color, "visible": true})).unwrap();
+    s.execute("style.character.create", &json!({"name": style, "chars": {"conditions": [name]}})).unwrap();
+    s.execute("style.character.create", &json!({"name": cover, "chars": {"conditions": []}})).unwrap();
+    select_all(&mut s, sid);
+    s.execute("type.para", &json!({"attrs": {"grepStyles": [{"style": style, "pattern": pattern}, {"style": cover, "pattern": pattern}]}})).unwrap();
+
+    let fitted = doc(&s);
+    let shown = fresh(&fitted, sid);
+    assert!(!shown.is_overset());
+    let mut fitted_hidden = (*fitted).clone();
+    fitted_hidden.conditions[0].visible = false;
+    same_composition(&shown, &fresh(&fitted_hidden, sid));
+
+    let removed = remove_tail(&mut s, sid);
+    let before = doc(&s);
+    let old_story = before.stories.get(&sid).unwrap();
+    assert_eq!(old_story.paras.len(), 1, "fixture: both rules cover the same single paragraph");
+    assert_eq!(old_story.text, WORDS.repeat(250));
+    assert_eq!(before.conditions, vec![designcraft_doc::Condition { name: name.to_string(), color, visible: true }]);
+    let matches: Vec<_> = regex::Regex::new(pattern).unwrap().find_iter(&old_story.text).map(|m| m.range()).collect();
+    assert_eq!(matches.len(), 250, "fixture: this is a matching, not an unused-pattern control");
+    assert!(matches.iter().all(|range| !range.is_empty() && &old_story.text[range.clone()] == pattern));
+    let (props, base) = before.styles.resolve_para(&old_story.paras[0]);
+    assert_eq!(props.grep_styles.len(), 2);
+    assert_eq!((props.grep_styles[0].style.as_str(), props.grep_styles[0].pattern.as_str()), (style, pattern));
+    assert_eq!((props.grep_styles[1].style.as_str(), props.grep_styles[1].pattern.as_str()), (cover, pattern));
+    assert!(props.nested_styles.is_empty() && props.nested_line_styles.is_empty());
+    assert!(base.conditions.is_empty());
+    for (_, format) in old_story.runs() {
+        assert!(before.styles.resolve_char(&base, format).conditions.is_empty(), "fixture: no run directly applies the condition");
+    }
+    let conditional = designcraft_doc::CharFormat { style: style.to_string(), ..Default::default() };
+    let unconditional = designcraft_doc::CharFormat { style: cover.to_string(), ..Default::default() };
+    assert_eq!(before.styles.resolve_char(&base, &conditional).conditions, vec![name.to_string()]);
+    assert!(before.styles.resolve_char(&base, &unconditional).conditions.is_empty());
+    let overlays = compose::paragraph_style_overlays(&old_story.text, &props.nested_styles, &props.grep_styles);
+    let expected_overlays: Vec<_> = matches
+        .iter()
+        .cloned()
+        .map(|range| (range, style.to_string()))
+        .chain(matches.iter().cloned().map(|range| (range, cover.to_string())))
+        .collect();
+    assert_eq!(overlays, expected_overlays, "fixture: both nonempty range sets are identical, with unconditional Cover last");
+    for range in &matches {
+        for at in range.clone() {
+            let last = overlays.iter().rev().find(|(range, _)| range.contains(&at)).unwrap();
+            assert_eq!(last.1, cover, "fixture: the conditional rule wins no matched character");
+        }
+    }
+    let reduced = fresh(&before, sid);
+    let overset = reduced.overset_at.unwrap();
+    assert!(matches.iter().any(|range| range.end <= overset));
+    assert!(matches.iter().any(|range| range.start > overset), "fixture: the shadowed rules also match the uncomposed tail");
+    same_composition(&reduced, &s.cache.get(&before, sid, None));
+
+    // Specify the complete Doc independently; preview only checks the command's own delta.
+    let mut expected = (*before).clone();
+    expected.conditions[0].visible = false;
+    let expected = Arc::new(expected);
+    assert!(expected.conditions_hide(&[name.to_string()]));
+    same_composition(&reduced, &fresh(&expected, sid));
+    let params = json!({"name": name, "visible": false});
+    let toggled = probe(&mut s, "condition.options", params.clone());
+    assert_eq!(*toggled, *expected, "the toggle itself must change only condition visibility");
+    assert_eq!(full_doc(&toggled), full_doc(&expected));
+    assert!(Arc::ptr_eq(old_story, toggled.stories.get(&sid).unwrap()));
+    assert!(Arc::ptr_eq(&before.styles, &toggled.styles));
+    same_composition(&reduced, &fresh(&toggled, sid));
+
+    let count = s.doc().unwrap().history.undo.len();
+    let journal = s.journal.len();
+    s.execute("condition.options", &params).unwrap();
+    assert_eq!(s.journal.len(), journal + 1, "one condition edit produces one journal entry");
+    assert_eq!(s.journal.last().unwrap(), &("condition.options".into(), params));
+    assert_eq!(
+        doc(&s).page_count(),
+        before.page_count(),
+        "defect oracle: a fully shadowed GREP condition must not recreate intentionally removed primary pages"
+    );
+    preserved(&mut s, sid, removed, &before, &expected, count);
+}
+
+#[test]
+fn r53_partially_shadowed_overset_grep_condition_resumes_primary_growth() {
+    let (mut s, sid) = primary_chain(false);
+    assert!(s.prefs.smart_text_reflow);
+    let name = "Partly covered GREP tail";
+    let style = "R53 GREP";
+    let cover = "R53 Cover";
+    let prefix = "R53_CONDITIONAL_";
+    let pattern = "R53_CONDITIONAL_GREP_TAIL";
+    let color = [10, 20, 30];
+    s.execute("condition.new", &json!({"name": name, "color": color, "visible": true})).unwrap();
+    s.execute("style.character.create", &json!({"name": style, "chars": {"conditions": [name]}})).unwrap();
+    s.execute("style.character.create", &json!({"name": cover, "chars": {"conditions": []}})).unwrap();
+
+    let fitted = doc(&s);
+    let composed = fresh(&fitted, sid);
+    let last = *fitted.story(sid).unwrap().frames.last().unwrap();
+    let range = &composed.frame(last).unwrap().range;
+    assert!(range.end - range.start > 4 * WORDS.len(), "fixture: occupied last page has room for unconditioned text and the match");
+    let end = range.start + 2 * WORDS.len();
+    let start = end + 1;
+    s.execute("text.select", &json!({"story": sid.0, "anchor": end, "focus": fitted.story(sid).unwrap().len()})).unwrap();
+    s.execute("text.insert", &json!({"text": format!("\n{pattern}")})).unwrap();
+    select_all(&mut s, sid);
+    s.execute("type.para", &json!({"attrs": {"grepStyles": [{"style": style, "pattern": pattern}, {"style": cover, "pattern": prefix}]}})).unwrap();
+    let match_range = start..start + pattern.len();
+    let cover_range = start..start + prefix.len();
+    let used_range = cover_range.end..match_range.end;
+    assert!(match_range.start == cover_range.start && !used_range.is_empty());
+    let visible_used =
+        |cs: &ComposedStory| cs.frames.iter().flat_map(|f| &f.lines).flat_map(|l| &l.glyphs).any(|g| g.visible && used_range.contains(&g.byte));
+    let visible_cover =
+        |cs: &ComposedStory| cs.frames.iter().flat_map(|f| &f.lines).flat_map(|l| &l.glyphs).any(|g| g.visible && cover_range.contains(&g.byte));
+    let shown = fresh(&doc(&s), sid);
+    assert!(!shown.is_overset(), "fixture: the actual matched text fits before capacity removal");
+    assert!(visible_used(&shown), "fixture: the unshadowed suffix really draws when its condition is visible");
+    assert!(visible_cover(&shown), "fixture: the later unconditional prefix really draws");
+    s.execute("condition.options", &json!({"name": name, "visible": false})).unwrap();
+    let hidden = fresh(&doc(&s), sid);
+    assert!(!hidden.is_overset());
+    assert!(!visible_used(&hidden), "fixture: the still-winning conditional suffix really hides");
+    assert!(visible_cover(&hidden), "fixture: the shadowing prefix remains visible");
+
+    let removed = remove_tail(&mut s, sid);
+    let before = doc(&s);
+    let old_story = before.stories.get(&sid).unwrap();
+    let matches: Vec<_> = regex::Regex::new(pattern).unwrap().find_iter(&old_story.text).map(|m| m.range()).collect();
+    assert_eq!(matches, vec![match_range.clone()], "fixture: exactly one nonempty GREP match at the asserted tail range");
+    let covers: Vec<_> = regex::Regex::new(prefix).unwrap().find_iter(&old_story.text).map(|m| m.range()).collect();
+    assert_eq!(covers, vec![cover_range.clone()], "fixture: the later rule covers only a proper prefix of the one conditional match");
+    for para in &old_story.paras {
+        let (props, base) = before.styles.resolve_para(para);
+        assert_eq!(props.grep_styles.len(), 2);
+        assert_eq!((props.grep_styles[0].style.as_str(), props.grep_styles[0].pattern.as_str()), (style, pattern));
+        assert_eq!((props.grep_styles[1].style.as_str(), props.grep_styles[1].pattern.as_str()), (cover, prefix));
+        assert!(props.nested_styles.is_empty() && props.nested_line_styles.is_empty());
+        assert!(base.conditions.is_empty(), "fixture: no paragraph applies the condition directly");
+        for (_, format) in old_story.runs() {
+            assert!(before.styles.resolve_char(&base, format).conditions.is_empty(), "fixture: no run applies the condition directly");
+        }
+        let format = designcraft_doc::CharFormat { style: style.to_string(), ..Default::default() };
+        assert_eq!(before.styles.resolve_char(&base, &format).conditions, vec![name.to_string()]);
+        let cover_format = designcraft_doc::CharFormat { style: cover.to_string(), ..Default::default() };
+        assert!(before.styles.resolve_char(&base, &cover_format).conditions.is_empty());
+    }
+    let para_range = &old_story.para_ranges()[old_story.para_at(start)];
+    assert_eq!(para_range.start, start);
+    let (props, _) = before.styles.resolve_para(&old_story.paras[old_story.para_at(start)]);
+    let overlays = compose::paragraph_style_overlays(&old_story.text[para_range.clone()], &props.nested_styles, &props.grep_styles);
+    assert_eq!(overlays, vec![(0..pattern.len(), style.to_string()), (0..prefix.len(), cover.to_string())]);
+    for at in 0..pattern.len() {
+        let last = overlays.iter().rev().find(|(range, _)| range.contains(&at)).unwrap();
+        assert_eq!(last.1, if at < prefix.len() { cover } else { style }, "fixture: only the prefix is shadowed");
+    }
+    assert_eq!(before.conditions, vec![designcraft_doc::Condition { name: name.to_string(), color, visible: false }]);
+    let reduced = fresh(&before, sid);
+    assert!(
+        reduced.overset_at.is_some_and(|at| at < end && at < match_range.start),
+        "fixture: unconditioned text oversets before the entire actual GREP match"
+    );
+    same_composition(&reduced, &s.cache.get(&before, sid, None));
+
+    // The independent expected Doc changes only visibility; the matching tail is not yet composed.
+    let mut expected = (*before).clone();
+    expected.conditions[0].visible = true;
+    let params = json!({"name": name, "visible": true});
+    let toggled = probe(&mut s, "condition.options", params.clone());
+    assert_eq!(*toggled, expected, "the public toggle itself changes only condition visibility");
+    assert_eq!(full_doc(&toggled), full_doc(&expected));
+    assert!(Arc::ptr_eq(old_story, toggled.stories.get(&sid).unwrap()));
+    assert!(Arc::ptr_eq(&before.styles, &toggled.styles));
+    let still_overset = fresh(&expected, sid);
+    assert!(still_overset.is_overset());
+    same_composition(&reduced, &still_overset);
+
+    let count = s.doc().unwrap().history.undo.len();
+    let journal = s.journal.len();
+    s.execute("condition.options", &params).unwrap();
+    let after = doc(&s);
+    assert!(after.page_count() > before.page_count(), "a condition on an actual overset GREP match must resume primary growth");
+    let added = after.page_count() - before.page_count();
+    let old_frames = old_story.frames.len();
+    let new_story = after.story(sid).unwrap();
+    assert_eq!(new_story.frames.len(), old_frames + added);
+    assert_eq!(new_story.rev, old_story.rev + added as u64, "each appended primary frame advances the thread revision once");
+    assert_eq!(&new_story.frames[..old_frames], &old_story.frames);
+    assert_eq!(after.spreads.len(), before.spreads.len() + added);
+    assert!(!after.settings.facing_pages);
+    for (sp, frame) in after.spreads[before.spreads.len()..].iter().zip(&new_story.frames[old_frames..]) {
+        assert_eq!(sp.pages.len(), 1);
+        assert_eq!(sp.items.len(), 1);
+        assert_eq!(sp.items[0].id, *frame);
+        assert_eq!(sp.items[0].text_frame().unwrap().story, sid);
+        assert_eq!(sp.items[0].bounds(), sp.pages[0].margin_rect());
+    }
+    assert!(after.next_id > before.next_id);
+    assert_eq!(s.journal.len(), journal + 1);
+    assert_eq!(s.journal.last().unwrap(), &("condition.options".into(), params));
+    let expanded = fresh(&after, sid);
+    assert!(visible_used(&expanded), "the unshadowed conditional suffix must actually compose after growth");
+    assert!(visible_cover(&expanded), "the shadowing prefix remains visible after growth");
+
+    // Account only for the structurally asserted new capacity, IDs and thread revisions.
+    let mut without_growth = (*after).clone();
+    without_growth.spreads.truncate(before.spreads.len());
+    for (sp, old) in without_growth.spreads.iter_mut().zip(&before.spreads) {
+        Arc::make_mut(sp).id = old.id;
+    }
+    let restored_story = Arc::make_mut(without_growth.stories.get_mut(&sid).unwrap());
+    restored_story.frames.truncate(old_frames);
+    restored_story.rev = old_story.rev;
+    without_growth.next_id = before.next_id;
+    assert_eq!(without_growth, expected, "apart from asserted capacity/IDs/revisions, only condition visibility may change");
+    assert_eq!(full_doc(&without_growth), full_doc(&expected));
+    growth(&mut s, sid, Some(removed), &before, count);
+}

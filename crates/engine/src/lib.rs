@@ -702,18 +702,24 @@ fn reflow_formats_same(
     if depth >= 64 {
         return false;
     }
-    // Match shaping's all-hidden rule only for formatting used or referenced here.
     // A condition-bank edit can change visibility while style/story Arcs stay shared.
+    // Compare effective consumers only after the conservative format/dependency checks.
+    let condition_bank_changed = before.conditions != after.conditions;
     let conditions_same = |chars: &designcraft_doc::CharProps| before.conditions_hide(&chars.conditions) == after.conditions_hide(&chars.conditions);
     let mut runs = story.runs().zip(current.runs()).peekable();
     for ((range, para), current_para) in story.para_ranges().into_iter().zip(&story.paras).zip(&current.paras) {
         let old = a.resolve_para(para);
         let new = b.resolve_para(current_para);
-        if old != new || !conditions_same(&old.1) || !reflow_composite_same(a, b, &old.1) {
+        if old != new || !reflow_composite_same(a, b, &old.1) {
             return false;
         }
         // These rules inject character styles without recording them in the story's runs.
         // Compare their resolved dependencies even in paragraphs not reached by composition.
+        let mut may_change_visibility = !conditions_same(&old.1);
+        if range.is_empty() && may_change_visibility {
+            return false;
+        }
+        let mut condition_runs = Vec::new();
         for name in old
             .0
             .nested_styles
@@ -731,8 +737,15 @@ fn reflow_formats_same(
             }
             let format = designcraft_doc::CharFormat { style: name.into(), ..Default::default() };
             let chars = a.resolve_char(&old.1, &format);
-            if chars != b.resolve_char(&old.1, &format) || !conditions_same(&chars) || !reflow_composite_same(a, b, &chars) {
+            if chars != b.resolve_char(&old.1, &format) || !reflow_composite_same(a, b, &chars) {
                 return false;
+            }
+            if !conditions_same(&chars) {
+                // Line ranges depend on layout; note markers also inject their style separately.
+                if old.0.nested_line_styles.iter().any(|rule| rule.style == name) || (!story.notes.is_empty() && name == note_style) {
+                    return false;
+                }
+                may_change_visibility = true;
             }
         }
         while let Some(((run, format), (_, current_format))) = runs.peek() {
@@ -745,13 +758,28 @@ fn reflow_formats_same(
                 return false;
             }
             let chars = a.resolve_char(&old.1, format);
-            if chars != b.resolve_char(&new.1, current_format) || !conditions_same(&chars) || !reflow_composite_same(a, b, &chars) {
+            if chars != b.resolve_char(&new.1, current_format) || !reflow_composite_same(a, b, &chars) {
                 return false;
+            }
+            let visibility_changed = !conditions_same(&chars);
+            if range.is_empty() && visibility_changed {
+                return false;
+            }
+            may_change_visibility |= visibility_changed;
+            if condition_bank_changed && run.end > range.start && run.start < range.end {
+                condition_runs.push((run.start.max(range.start) - range.start..run.end.min(range.end) - range.start, *format));
             }
             if run.end > range.end {
                 break;
             }
             runs.next();
+        }
+        if may_change_visibility && !range.is_empty() {
+            let Some(paragraph) = story.text.get(range.clone()) else { return false };
+            // Whole-paragraph consumers use shaping's winner plus the run's own style/overrides.
+            if !compose::paragraph_conditions_same(before, after, paragraph, &old.0, &old.1, condition_runs.into_iter()) {
+                return false;
+            }
         }
     }
     story.tables.values().zip(current.tables.values()).all(|(old, new)| {

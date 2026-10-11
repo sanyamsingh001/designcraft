@@ -42,6 +42,46 @@ pub use crate::notes::{find_note, hit_note, note_caret};
 use crate::shape::{Glyph, StyleTable, SubstCtx};
 pub use crate::table::{PlacedCell, StrokeSeg, TableFrag, cell_caret, find_cell, hit_cell};
 
+/// Character-style overlays for a complete paragraph, in application order (later wins).
+/// Returned byte ranges are relative to `text`.
+pub fn paragraph_style_overlays(
+    text: &str,
+    nested: &[designcraft_doc::NestedStyle],
+    grep: &[designcraft_doc::GrepStyle],
+) -> Vec<(Range<usize>, String)> {
+    overlay::overlays(text, 0..text.len(), nested, grep)
+}
+
+/// Compare condition visibility on a complete paragraph, including its overset text.
+/// Run ranges are paragraph-relative. Invalid/incomplete coverage conservatively differs.
+/// Requires already-matched story formatting and style definitions. Callers separately
+/// retain layout-dependent line/note and style-definition dependencies.
+pub fn paragraph_conditions_same<'a>(
+    before: &Document,
+    after: &Document,
+    text: &str,
+    para: &ParaProps,
+    base: &designcraft_doc::CharProps,
+    runs: impl Iterator<Item = (Range<usize>, &'a designcraft_doc::CharFormat)>,
+) -> bool {
+    let overlays = overlay::overlays(text, 0..text.len(), &para.nested_styles, &para.grep_styles);
+    let mut end = 0;
+    for segment in shape::style_segments(runs, 0..text.len(), &overlays) {
+        if segment.range.start != end || !text.is_char_boundary(segment.range.start) || !text.is_char_boundary(segment.range.end) {
+            return false;
+        }
+        end = segment.range.end;
+        let base = shape::overlay_base(&before.styles, base, segment.overlay);
+        let chars = before.styles.resolve_char(base.as_ref(), segment.format);
+        if chars.change != designcraft_doc::ChangeMark::Deleted
+            && before.conditions_hide(&chars.conditions) != after.conditions_hide(&chars.conditions)
+        {
+            return false;
+        }
+    }
+    end == text.len()
+}
+
 /// Character appearance shared by many glyphs (indexed from [`PlacedGlyph::style`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStyle {

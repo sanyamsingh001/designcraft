@@ -17,3 +17,5 @@ The [machine-readable manifest](recovery-manifest.json) maps 393 verified source
 The private evidence directory disappeared before backup. Source proposals existing only there cannot be claimed recovered. For the 402 registered directories already absent at intake, recorded commits and surviving staged indexes are saved, but missing unstaged/untracked bytes remain unknown. Build outputs, logs, private captures and credentials are excluded.
 
 Conflicting variants remain separate. The unmerged index is represented by three labeled stage views, without resolution. Existing published branches were not updated. See the manifest for exact source trees and mappings.
+
+The final bounded ref supplement also records 19 custom refs outside the initial heads/remotes/tags baseline. All locally available commit identities are backed up; no missing-object hydration was attempted.

@@ -2,12 +2,12 @@
   "status": "UNTESTED source recovery, not validated feature publication",
   "repository": "https://github.com/sanyamsingh001/designcraft.git",
   "namespace": "recovery/untested-design-20261019-1854",
-  "created_utc": "2026-10-19T19:11:24.164101+00:00",
+  "created_utc": "2026-10-19T19:13:43.646847+00:00",
   "verified_source_ref_count": 393,
   "counts": {
     "surviving_physical_checkouts": 93,
     "snapshot_and_alias_refs": 95,
-    "original_refs_recorded": 48,
+    "original_refs_recorded": 67,
     "registered_worktree_heads_recorded": 495,
     "distinct_original_commit_refs": 101,
     "surviving_worktree_indexes": 494,
@@ -1095,6 +1095,82 @@
     }
   ],
   "original_refs": [
+    {
+      "ref": "refs/codex-local/consolidation-443ea46-20261019-b4e923a1",
+      "oid": "443ea4640ca368fcf0241b04813bd3817acd5df8"
+    },
+    {
+      "ref": "refs/codex-local/consolidation-5aeb4dd-20261017-4f9a21c6",
+      "oid": "5aeb4dd743067e5a6d797d0f613448a06d141a09"
+    },
+    {
+      "ref": "refs/codex-local/consolidation-7cb8b125-20261018-67c09d14",
+      "oid": "7cb8b12507def48fb9346e5004340b5e8e4cfcb7"
+    },
+    {
+      "ref": "refs/codex-local/consolidation-b17efb2-20261017-be41d8a7",
+      "oid": "b17efb2ddfcd3be55716e4dad66453960f45d394"
+    },
+    {
+      "ref": "refs/codex-local/consolidation-c2609-20261016-8c1e24f7",
+      "oid": "c2609f921bb65825a9d41e9882a2f0b712276989"
+    },
+    {
+      "ref": "refs/codex-local/consolidation-ecd7e5d-20261018-76e2b411",
+      "oid": "ecd7e5d063eb12fa5e61fe61c9b8a77bb3c9110a"
+    },
+    {
+      "ref": "refs/codex-local/consolidation-fc36957-20261017-7d2c90b6",
+      "oid": "fc36957fe05f38a6976df4734d52b9250cd54a2c"
+    },
+    {
+      "ref": "refs/codex/checkbox681-main-20261013",
+      "oid": "91263c912f1c1f2c61c087541d446e88edf43401"
+    },
+    {
+      "ref": "refs/codex/parity-main-20261013-e862",
+      "oid": "e862e0a613c0793c6fea7cfd37ad4145ed6cf686"
+    },
+    {
+      "ref": "refs/codex/parity/main-11a-20261014",
+      "oid": "11a51d5b665aec8d6e675bd107a8a01514f10d00"
+    },
+    {
+      "ref": "refs/codex/parity/main-d07-20261014",
+      "oid": "d07cbbe94c2762865eaefeff4ebfd1dbada180a0"
+    },
+    {
+      "ref": "refs/codex/repair-backup-20261013/pr303",
+      "oid": "087af55cbf99ea821fff66b9ca7edcbb9e1c8934"
+    },
+    {
+      "ref": "refs/codex/repair-backup-20261013/pr457",
+      "oid": "9cb8d05a3843fc1075f36529e49619ade5df740d"
+    },
+    {
+      "ref": "refs/codex/repair-backup-20261013/pr458",
+      "oid": "3bb7c916ad874d3defaf67882b2df27337b828ae"
+    },
+    {
+      "ref": "refs/codex/repair-backup-20261013/pr459",
+      "oid": "1c7f7ac13212488ba1ff999967cb518fd4b7fdd8"
+    },
+    {
+      "ref": "refs/codex/repair-backup-20261013/pr465",
+      "oid": "92aaa3d51d5596c5eaf4ada882cef618443567d9"
+    },
+    {
+      "ref": "refs/codex/repair-backup-20261013/pr478",
+      "oid": "8f33ef36d446af17ab01955928fee1b657c47ad4"
+    },
+    {
+      "ref": "refs/codex/repair-backup-20261013/pr542",
+      "oid": "c08b3ddc685ece9534850884567fa3dbac6784a4"
+    },
+    {
+      "ref": "refs/codex/upstream-review29-current",
+      "oid": "4e0e3949f1eb91c874f2a47d58c2187031f4c97e"
+    },
     {
       "ref": "refs/heads/codex/ci-psd-prerequisite",
       "oid": "df9cf5acdb1c68f3e6dc57d3f43f381275530831"
@@ -10908,5 +10984,88 @@
     "One initial validation snapshot omitted seven untracked packaging/configuration files. The complete parity-validation-dc8-complete alias preserves all 577 files, verified byte-for-byte and Git-mode-for-mode against the surviving validation checkout.",
     "Original commits retain their original identities and parent history. New snapshot/staged-view/manifest commits use the required recovery identity and Codex co-author trailer.",
     "No existing published PR branch was changed, no upstream merge was performed, and original local source/index/ref state was not reset."
-  ]
+  ],
+  "additional_custom_ref_coverage": {
+    "earlier_baseline_scope": "48 heads/remotes/tags refs; all unchanged",
+    "additional_refs": [
+      {
+        "ref": "refs/codex-local/consolidation-443ea46-20261019-b4e923a1",
+        "oid": "443ea4640ca368fcf0241b04813bd3817acd5df8"
+      },
+      {
+        "ref": "refs/codex-local/consolidation-5aeb4dd-20261017-4f9a21c6",
+        "oid": "5aeb4dd743067e5a6d797d0f613448a06d141a09"
+      },
+      {
+        "ref": "refs/codex-local/consolidation-7cb8b125-20261018-67c09d14",
+        "oid": "7cb8b12507def48fb9346e5004340b5e8e4cfcb7"
+      },
+      {
+        "ref": "refs/codex-local/consolidation-b17efb2-20261017-be41d8a7",
+        "oid": "b17efb2ddfcd3be55716e4dad66453960f45d394"
+      },
+      {
+        "ref": "refs/codex-local/consolidation-c2609-20261016-8c1e24f7",
+        "oid": "c2609f921bb65825a9d41e9882a2f0b712276989"
+      },
+      {
+        "ref": "refs/codex-local/consolidation-ecd7e5d-20261018-76e2b411",
+        "oid": "ecd7e5d063eb12fa5e61fe61c9b8a77bb3c9110a"
+      },
+      {
+        "ref": "refs/codex-local/consolidation-fc36957-20261017-7d2c90b6",
+        "oid": "fc36957fe05f38a6976df4734d52b9250cd54a2c"
+      },
+      {
+        "ref": "refs/codex/checkbox681-main-20261013",
+        "oid": "91263c912f1c1f2c61c087541d446e88edf43401"
+      },
+      {
+        "ref": "refs/codex/parity-main-20261013-e862",
+        "oid": "e862e0a613c0793c6fea7cfd37ad4145ed6cf686"
+      },
+      {
+        "ref": "refs/codex/parity/main-11a-20261014",
+        "oid": "11a51d5b665aec8d6e675bd107a8a01514f10d00"
+      },
+      {
+        "ref": "refs/codex/parity/main-d07-20261014",
+        "oid": "d07cbbe94c2762865eaefeff4ebfd1dbada180a0"
+      },
+      {
+        "ref": "refs/codex/repair-backup-20261013/pr303",
+        "oid": "087af55cbf99ea821fff66b9ca7edcbb9e1c8934"
+      },
+      {
+        "ref": "refs/codex/repair-backup-20261013/pr457",
+        "oid": "9cb8d05a3843fc1075f36529e49619ade5df740d"
+      },
+      {
+        "ref": "refs/codex/repair-backup-20261013/pr458",
+        "oid": "3bb7c916ad874d3defaf67882b2df27337b828ae"
+      },
+      {
+        "ref": "refs/codex/repair-backup-20261013/pr459",
+        "oid": "1c7f7ac13212488ba1ff999967cb518fd4b7fdd8"
+      },
+      {
+        "ref": "refs/codex/repair-backup-20261013/pr465",
+        "oid": "92aaa3d51d5596c5eaf4ada882cef618443567d9"
+      },
+      {
+        "ref": "refs/codex/repair-backup-20261013/pr478",
+        "oid": "8f33ef36d446af17ab01955928fee1b657c47ad4"
+      },
+      {
+        "ref": "refs/codex/repair-backup-20261013/pr542",
+        "oid": "c08b3ddc685ece9534850884567fa3dbac6784a4"
+      },
+      {
+        "ref": "refs/codex/upstream-review29-current",
+        "oid": "4e0e3949f1eb91c874f2a47d58c2187031f4c97e"
+      }
+    ],
+    "missing_objects": [],
+    "no_hydration": true
+  }
 }

@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override for a test run, e.g. 0.2.0-rc.1 (empty: Cargo.toml)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  hyphenation-source:
+    name: Russian hyphenation source companion
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: version
+        name: Resolve the release version
+        uses: storytold/craft-common-actions/actions/resolve-version@main
+        with:
+          input-version: ${{ inputs.version }}
+          app-title: DesignCraft
+      - name: Source and license companion for every distribution format
+        run: python3 packaging/hyphenation-source.py dist/hyphenation-source/designcraft-hyphenation-source.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-hyphenation-source
+          path: dist/hyphenation-source/designcraft-hyphenation-source.zip
+          if-no-files-found: error
+
+  release:
+    needs: hyphenation-source
+    # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
+    uses: storytold/craft-common-actions/.github/workflows/release.yml@main
+    with:
+      app-name: designcraft
+      app-title: DesignCraft
+      craft-fonts-ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+      version: ${{ inputs.version }}
+    secrets:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+
+  hyphenation-notes:
+    name: Russian hyphenation source notices
+    needs: [hyphenation-source, release]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.hyphenation-source.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Preserve source and license links in the draft notes
+        shell: bash
+        run: |
+          tag="v$VERSION"
+          draft="$(gh release view "$tag" --json isDraft --jq .isDraft)"
+          if [ "$draft" != "true" ]; then
+            echo "::error::Release $tag is not a draft; refusing to change its notes."
+            exit 1
+          fi
+          notes="$RUNNER_TEMP/designcraft-release-notes.md"
+          gh release view "$tag" --json body --jq .body >"$notes"
+          if ! grep -qF '### Russian hyphenation source and license' "$notes"; then
+            {
+              printf '\n### Russian hyphenation source and license\n\n'
+              printf 'All binary formats share [the source, license and integration source](https://github.com/%s/releases/download/%s/designcraft-hyphenation-source.zip).\n' "$GH_REPO" "$tag"
+              printf 'The [matching complete DesignCraft source](https://github.com/%s/archive/%s.tar.gz) is also available.\n' "$GH_REPO" "$GITHUB_SHA"
+              printf 'The original four-file Russian work is available from [CTAN](https://mirrors.ctan.org/language/hyphenation/ruhyphen.zip). Keep these source downloads and notices with mirrored binaries.\n'
+            } >>"$notes"
+          fi
+          # An existing draft can be rebuilt from a newer commit; refresh its source link.
+          sed -i -E "s@https://github.com/$GH_REPO/archive/[[:xdigit:]]+\.tar\.gz@https://github.com/$GH_REPO/archive/$GITHUB_SHA.tar.gz@g" "$notes"
+          gh release edit "$tag" --notes-file "$notes"

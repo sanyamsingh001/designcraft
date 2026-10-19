@@ -1,0 +1,35 @@
+# Quick static checks for the release pipeline (seconds, no Rust build): workflow syntax,
+# packaging shell/PowerShell scripts, and the Linux desktop/AppStream/Flatpak metadata.
+name: Packaging lint
+
+on:
+  push:
+    branches: [main, release]
+    paths: [".github/workflows/**", "packaging/**", "assets/app-icon/**", "crates/compose/src/hyphen/**"]
+  pull_request:
+    paths: [".github/workflows/**", "packaging/**", "assets/app-icon/**", "crates/compose/src/hyphen/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
+    uses: storytold/craft-common-actions/.github/workflows/packaging-lint.yml@main
+
+  hyphenation-docs:
+    name: Hyphenation source and license distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install source-distribution check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-yaml zip
+      - name: Hyphenation source and license distribution (stub binaries)
+        run: python3 packaging/tests/hyphenation-docs.py

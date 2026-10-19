@@ -1,0 +1,1157 @@
+//! File › Place of text files (plain text, Word, RTF): into the text insertion point, the
+//! selected frame, or a new frame on the page; with autoflow, pages and threaded frames are added
+//! until the whole story fits (InDesign's Shift-click with a loaded text cursor).
+
+use designcraft_doc::{CharacterStyle, Content, Document, ParaFormat, ParagraphStyle, SpreadRef, Story, StoryId, TextFileLink, TextSel};
+use designcraft_geom::Rect;
+use serde_json::{Value, json};
+
+use super::bad;
+use crate::{Result, Session};
+
+/// Add the imported styles the document doesn't have yet (existing styles win, as in InDesign's
+/// default style-conflict option).
+/// How imported styles that share a name with the document's are handled (Word Import Options).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Conflict {
+    /// Use the document's definition.
+    UseExisting,
+    /// The imported definition replaces the document's.
+    Redefine,
+    /// Import under a new name (`Name_wrd_1`).
+    AutoRename,
+}
+
+impl Conflict {
+    fn parse(c: &str) -> Result<Self> {
+        match c {
+            "useExisting" | "" => Ok(Conflict::UseExisting),
+            "redefine" => Ok(Conflict::Redefine),
+            "autoRename" => Ok(Conflict::AutoRename),
+            c => Err(bad("file.place", format!("unknown styleConflicts `{c}` (useExisting, redefine, autoRename)"))),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Conflict::UseExisting => "useExisting",
+            Conflict::Redefine => "redefine",
+            Conflict::AutoRename => "autoRename",
+        }
+    }
+}
+
+/// Map imported style names (`styleMap`) and resolve name clashes in the import before it lands.
+/// Returns `map` with the names Auto Rename chose.
+fn map_styles(
+    d: &Document,
+    imp: &mut designcraft_textimport::Imported,
+    map: &std::collections::HashMap<String, String>,
+    conflict: Conflict,
+) -> std::collections::HashMap<String, String> {
+    let mut rename: std::collections::HashMap<String, String> = map.clone();
+    if conflict == Conflict::AutoRename {
+        let st = &d.styles;
+        for s in imp.para_styles.iter().filter(|s| !map.contains_key(&s.name) && st.para(&s.name).is_some()) {
+            if let Some(n) = (1..=st.paragraph.len() + 1).map(|i| format!("{}_wrd_{i}", s.name)).find(|n| st.para(n).is_none()) {
+                rename.insert(s.name.clone(), n);
+            }
+        }
+        for s in imp.char_styles.iter().filter(|s| !map.contains_key(&s.name) && st.char_style(&s.name).is_some()) {
+            if let Some(n) = (1..=st.character.len() + 1).map(|i| format!("{}_wrd_{i}", s.name)).find(|n| st.char_style(n).is_none()) {
+                rename.insert(s.name.clone(), n);
+            }
+        }
+    }
+    if rename.is_empty() {
+        return rename;
+    }
+    // Mapped styles aren't imported; renamed ones come in under their new name.
+    imp.para_styles.retain(|s| !map.contains_key(&s.name));
+    imp.char_styles.retain(|s| !map.contains_key(&s.name));
+    for s in imp.para_styles.iter_mut().chain(imp.char_styles.iter_mut()) {
+        if let Some(n) = rename.get(&s.name) {
+            s.name = n.clone();
+        }
+        if let Some(b) = s.based_on.as_ref().and_then(|b| rename.get(b)) {
+            s.based_on = Some(b.clone());
+        }
+    }
+    // Rename in place: Markdown's explicit/inherited emphasis flags follow source runs.
+    // Normalizing here could merge differently sourced runs mapped to the same style.
+    for p in &mut imp.story.paras {
+        if let Some(m) = rename.get(&p.style) {
+            p.style = m.clone();
+        }
+    }
+    for run in &mut imp.story.chars {
+        if let Some(m) = rename.get(&run.format.style) {
+            run.format.style = m.clone();
+        }
+    }
+    rename
+}
+
+fn add_styles(d: &mut Document, imp: &designcraft_textimport::Imported, conflict: Conflict) {
+    let st = d.styles_mut();
+    if conflict == Conflict::Redefine {
+        for s in &imp.para_styles {
+            if let Some(ps) = st.paragraph.iter_mut().find(|p| p.name == s.name) {
+                (ps.para, ps.chars) = (s.para.clone(), s.chars.clone());
+            }
+        }
+        for s in &imp.char_styles {
+            if let Some(cs) = st.character.iter_mut().find(|c| c.name == s.name) {
+                cs.chars = s.chars.clone();
+            }
+        }
+    }
+    for s in &imp.para_styles {
+        if st.para(&s.name).is_none() {
+            st.paragraph.push(ParagraphStyle {
+                name: s.name.clone(),
+                based_on: s.based_on.clone().or_else(|| Some(designcraft_doc::story::BASIC_PARAGRAPH.into())),
+                next_style: None,
+                para: s.para.clone(),
+                chars: s.chars.clone(),
+                shortcut: String::new(),
+            });
+        }
+    }
+    for s in &imp.char_styles {
+        if !st.character.iter().any(|c| c.name == s.name) {
+            st.character.push(CharacterStyle { name: s.name.clone(), based_on: s.based_on.clone(), chars: s.chars.clone(), shortcut: String::new() });
+        }
+    }
+}
+
+/// Combine additive Markdown italics with the paragraph style actually selected by placement.
+/// Explicit strong runs and explicitly mapped character styles retain their own definitions.
+fn resolve_markdown_emphasis(
+    imp: &mut designcraft_textimport::Imported,
+    emphasis: &[bool],
+    styles: &designcraft_doc::Styles,
+    first_paragraph: Option<&ParaFormat>,
+) -> Result<()> {
+    if emphasis.is_empty() {
+        return Ok(());
+    }
+    if emphasis.len() != imp.story.chars.len() {
+        return Err(bad("file.place", "Markdown emphasis runs changed during style mapping"));
+    }
+    if !emphasis.iter().any(|&inherit| inherit) {
+        return Ok(());
+    }
+    // Resolve paragraph bases once and walk runs/boundaries once, rather than rescanning
+    // the growing story for every emphasized run.
+    let bases: Vec<_> = imp
+        .story
+        .para_ranges()
+        .into_iter()
+        .zip(&imp.story.paras)
+        .enumerate()
+        .map(|(index, (range, p))| {
+            let p = if index == 0 { first_paragraph.unwrap_or(p) } else { p };
+            (range, styles.resolve_para(p).1)
+        })
+        .collect();
+    let mut paragraph = 0usize;
+    let mut at = 0usize;
+    for (run, inherit) in imp.story.chars.iter_mut().zip(emphasis) {
+        while bases.get(paragraph).is_some_and(|(range, _)| at > range.end) {
+            paragraph += 1;
+        }
+        if *inherit {
+            let (_, base) = bases.get(paragraph).ok_or_else(|| bad("file.place", "Markdown emphasis paragraph boundary"))?;
+            if matches!(base.font_style.as_str(), "Bold" | "Bold Italic") && styles.resolve_char(base, &run.format).font_style == "Italic" {
+                run.format.over.font_style = Some("Bold Italic".into());
+            }
+        }
+        at = at.checked_add(run.len).ok_or_else(|| bad("file.place", "Markdown emphasis character boundary"))?;
+    }
+    Ok(())
+}
+
+/// "Remove styles and formatting": every paragraph [Basic Paragraph], no local formatting.
+fn strip(story: &mut Story) {
+    let n = story.len();
+    story.format_paras(0..n, |p| *p = ParaFormat { table: p.table, ..Default::default() });
+    story.format_chars(0..n, |f| *f = Default::default());
+}
+
+/// The story's whole text replaced by the import's (its frames stay).
+fn fill(story: &mut Story, from: &Story) {
+    let n = story.len();
+    story.delete(0..n);
+    story.insert_story(0, from);
+    if let (Some(first), Some(p0)) = (from.paras.first(), story.paras.first_mut()) {
+        *p0 = ParaFormat { table: p0.table, ..first.clone() };
+    }
+}
+
+/// The link a story placed from `path` keeps (Create Links When Placing Text Files).
+/// `before`: the file's size and time before `bytes` were read (its time is kept only when the
+/// size matches what was read and it can be trusted, see [`super::links::settled`]).
+fn text_link(
+    path: &str,
+    bytes: &[u8],
+    before: Option<designcraft_doc::Fingerprint>,
+    (map, auto_renamed_styles): (std::collections::HashMap<String, String>, std::collections::BTreeSet<String>),
+    conflict: Conflict,
+    remove: bool,
+    story: &Story,
+) -> TextFileLink {
+    TextFileLink {
+        path: path.to_string(),
+        size: bytes.len() as u64,
+        hash: super::links::fnv_hex(bytes),
+        mtime: before.filter(|f| f.size == bytes.len() as u64 && super::links::settled(f)).map_or(0, |f| f.mtime),
+        style_map: map.into_iter().collect(),
+        auto_renamed_styles,
+        style_conflicts: conflict.name().into(),
+        remove_styles: remove,
+        story_hash: super::links::story_hash(story),
+    }
+}
+
+/// Update Link of a linked text file: `bytes` (read from `path`) imported again into the story
+/// with the import options it was placed with, keeping its frames. Returns the import's warnings.
+pub(crate) fn reimport(
+    d: &mut Document,
+    sid: StoryId,
+    path: &str,
+    bytes: &[u8],
+    before: Option<designcraft_doc::Fingerprint>,
+) -> Result<Vec<String>> {
+    let link =
+        d.story(sid).and_then(|s| s.file_link.clone()).ok_or_else(|| bad("links.update", format!("story {} isn't linked to a file", sid.0)))?;
+    let name = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
+    let mut imp = designcraft_textimport::import(&name, bytes).map_err(|e| bad("links.update", format!("{name}: {e}")))?;
+    if link.remove_styles {
+        strip(&mut imp.story);
+        imp.para_styles.clear();
+        imp.char_styles.clear();
+    }
+    let mut emphasis = if link.remove_styles { Vec::new() } else { imp.prepare_markdown_emphasis(&name, bytes) };
+    let conflict = Conflict::parse(&link.style_conflicts)?;
+    // A mapping to a style the document no longer has is dropped: that style is imported again.
+    let map: std::collections::HashMap<String, String> =
+        link.style_map.into_iter().filter(|(_, to)| d.styles.para(to).is_some() || d.styles.char_style(to).is_some()).collect();
+    let mut automatic = link.auto_renamed_styles;
+    automatic.retain(|name| map.contains_key(name));
+    for (inherit, run) in emphasis.iter_mut().zip(&imp.story.chars) {
+        *inherit &= !map.contains_key(&run.format.style) || automatic.contains(&run.format.style);
+    }
+    let mapped = map_styles(d, &mut imp, &map, conflict);
+    automatic.extend(mapped.keys().filter(|name| !map.contains_key(*name)).cloned());
+    add_styles(d, &imp, conflict);
+    resolve_markdown_emphasis(&mut imp, &emphasis, &d.styles, None)?;
+    let story = d.story_mut(sid).ok_or(designcraft_doc::DocError::NoStory(sid))?;
+    fill(story, &imp.story);
+    story.file_link = Some(text_link(path, bytes, before, (mapped, automatic), conflict, link.remove_styles, story));
+    Ok(imp.warnings)
+}
+
+/// Is the story overset in its frames, and how much text do its full frames hold (bytes, frames)?
+/// A frame a column, frame or page break ends early is left out: it says nothing about how much
+/// a frame holds.
+fn fit(d: &Document, sid: StoryId) -> (Option<usize>, usize, usize) {
+    let cs = designcraft_compose::compose_story(d, sid, &Default::default());
+    let text = d.story(sid).map_or("", |s| s.text.as_str());
+    let is_break = |c: char| matches!(c, designcraft_doc::COLUMN_BREAK | designcraft_doc::FRAME_BREAK | designcraft_doc::PAGE_BREAK);
+    let (mut held, mut full) = (0, 0);
+    for f in &cs.frames {
+        let Some(shown) = text.get(f.range.clone()) else { continue };
+        if !shown.is_empty() && !shown.chars().any(is_break) {
+            held += shown.len();
+            full += 1;
+        }
+    }
+    (cs.overset_at, held, full)
+}
+
+/// Thread new frames on new pages (margin rectangles) until the story fits. Returns pages added.
+/// A story on a parent spread doesn't autoflow: its frames thread only on that parent. Errors
+/// name `cmd`, the command that autoflows.
+pub(crate) fn autoflow(d: &mut Document, sid: StoryId, max_pages: usize, cmd: &str) -> Result<usize> {
+    let last = d.story(sid).and_then(|s| s.frames.last().copied()).ok_or_else(|| bad(cmd, "the story has no frame"))?;
+    if !matches!(d.find(last).map(|l| l.spread), Some(SpreadRef::Doc(_))) {
+        return Err(bad(cmd, "autoflow works only from a frame on a document page"));
+    }
+    let mut added = 0;
+    loop {
+        let (overset, held, full) = fit(d, sid);
+        let Some(at) = overset else { return Ok(added) };
+        if added >= max_pages {
+            return Err(bad(cmd, format!("autoflow stopped after {max_pages} pages")));
+        }
+        let len = d.story(sid).map_or(0, |s| s.len());
+        // Frames still needed at the rate the full ones are filled (at least one); with no full
+        // frame to go by yet, one more page.
+        let want = held.checked_div(full).map_or(1, |per_frame| len.saturating_sub(at).div_ceil(per_frame.max(1))).clamp(1, max_pages - added);
+        let last = *d.story(sid).and_then(|s| s.frames.last()).ok_or_else(|| bad(cmd, "the story has no frame"))?;
+        let mut page = d.page_of_item(last).unwrap_or(d.page_count().saturating_sub(1));
+        let parent = d.page_loc(page).and_then(|(si, pi)| d.spreads[si].pages[pi].parent);
+        d.insert_pages(Some(page), want, parent)?;
+        let layer = d.default_layer();
+        let mut prev = last;
+        for _ in 0..want {
+            page += 1;
+            let (si, pi) = d.page_loc(page).ok_or_else(|| bad(cmd, "page insert failed"))?;
+            let r = d.spreads[si].pages[pi].margin_rect();
+            let (fid, _) = d.add_text_frame(SpreadRef::Doc(si), r, layer, "", ParaFormat::default())?;
+            d.thread(prev, fid)?;
+            prev = fid;
+        }
+        added += want;
+    }
+}
+
+pub(super) fn place_text(
+    s: &mut Session,
+    p: &Value,
+    name: &str,
+    bytes: &[u8],
+    path: Option<String>,
+    before: Option<designcraft_doc::Fingerprint>,
+) -> Result<Value> {
+    let mut imp = designcraft_textimport::import(name, bytes).map_err(|e| bad("file.place", e.to_string()))?;
+    let remove = p.get("removeStyles").and_then(Value::as_bool).unwrap_or(false);
+    if remove {
+        strip(&mut imp.story);
+        imp.para_styles.clear();
+        imp.char_styles.clear();
+    }
+    let mut emphasis = if remove { Vec::new() } else { imp.prepare_markdown_emphasis(name, bytes) };
+    let conflict = Conflict::parse(p.get("styleConflicts").and_then(Value::as_str).unwrap_or("useExisting"))?;
+    let map: std::collections::HashMap<String, String> = p
+        .get("styleMap")
+        .and_then(Value::as_object)
+        .map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
+        .unwrap_or_default();
+    for (inherit, run) in emphasis.iter_mut().zip(&imp.story.chars) {
+        *inherit &= !map.contains_key(&run.format.style);
+    }
+    let mapped = map_styles(&s.doc()?.doc, &mut imp, &map, conflict);
+    let automatic = mapped.keys().filter(|name| !map.contains_key(*name)).cloned().collect::<std::collections::BTreeSet<_>>();
+    let map = (mapped, automatic);
+    // Create Links When Placing Text Files (only a file on disk can be linked).
+    let link = path.filter(|_| p.get("link").and_then(Value::as_bool).unwrap_or(s.prefs.link_text_files));
+    // A file too large for the Links panel to check isn't linked.
+    let (link, too_large) = match link {
+        Some(_) if !super::links::checkable_size(bytes.len()) => (None, true),
+        l => (l, false),
+    };
+    let autoflow_on = p.get("autoflow").and_then(Value::as_bool).unwrap_or(false);
+    let st = s.doc()?;
+    let caret = st.selection.text.filter(|t| t.cell.is_none());
+    let frame = super::id_param(p, "frame").or_else(|| {
+        st.selection.items.iter().copied().find(|i| st.doc.item(*i).is_some_and(|it| matches!(it.content, Content::Unassigned | Content::Text(_))))
+    });
+    let page = p.get("page").and_then(Value::as_u64).map(|v| (v as usize).saturating_sub(1));
+    let rect = super::rect_param(p, "rect");
+    let mut warnings = imp.warnings.clone();
+    if too_large {
+        warnings.push("not linked: the file is too large to keep linked".into());
+    }
+    s.edit(|d, sel| {
+        add_styles(d, &imp, conflict);
+        let sid = if let Some(t) = caret {
+            // The first inserted paragraph inherits the surviving destination paragraph.
+            let r = t.range();
+            let first = {
+                let story = d.story_mut(t.story).ok_or(designcraft_doc::DocError::NoStory(t.story))?;
+                story.delete(r.clone());
+                story.paras.get(story.para_at(r.start)).cloned().ok_or_else(|| bad("file.place", "text insertion paragraph"))?
+            };
+            resolve_markdown_emphasis(&mut imp, &emphasis, &d.styles, Some(&first))?;
+            let story = d.story_mut(t.story).ok_or(designcraft_doc::DocError::NoStory(t.story))?;
+            let end = story.insert_story(r.start, &imp.story);
+            sel.text = Some(TextSel { anchor: end, focus: end, ..t });
+            if link.is_some() {
+                warnings.push("not linked: a linked text file fills a whole story, not an insertion point".into());
+            }
+            t.story
+        } else {
+            resolve_markdown_emphasis(&mut imp, &emphasis, &d.styles, None)?;
+            let fid = match frame {
+                Some(f) => f,
+                None => {
+                    let pg = page.unwrap_or(0).min(d.page_count().saturating_sub(1));
+                    let (si, pi) = d.page_loc(pg).ok_or_else(|| bad("file.place", "no such page"))?;
+                    let r: Rect = rect.unwrap_or_else(|| d.spreads[si].pages[pi].margin_rect());
+                    let layer = d.default_layer();
+                    d.add_text_frame(SpreadRef::Doc(si), r, layer, "", ParaFormat::default())?.0
+                }
+            };
+            // Empty frames become text frames.
+            let sid = match d.item(fid).map(|i| i.content.clone()) {
+                Some(Content::Text(t)) => t.story,
+                Some(_) => {
+                    let sid = StoryId(d.alloc());
+                    let mut ns = Story::new(sid);
+                    ns.direction = d.new_story_direction();
+                    ns.frames = vec![fid];
+                    d.stories.insert(sid, std::sync::Arc::new(ns));
+                    if let Some(it) = d.item_mut(fid) {
+                        it.content = Content::Text(designcraft_doc::TextFrame { story: sid, options: Default::default() });
+                    }
+                    sid
+                }
+                None => return Err(bad("file.place", "no such frame")),
+            };
+            let story = d.story_mut(sid).ok_or(designcraft_doc::DocError::NoStory(sid))?;
+            fill(story, &imp.story);
+            story.file_link = link.as_deref().map(|path| text_link(path, bytes, before, map.clone(), conflict, remove, story));
+            *sel = designcraft_doc::Selection::items(vec![fid]);
+            sid
+        };
+        let pages = if autoflow_on { autoflow(d, sid, 2000, "file.place")? } else { 0 };
+        let overset = fit(d, sid).0.is_some();
+        Ok(json!({"story": sid.0, "pagesAdded": pages, "overset": overset, "warnings": warnings}))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn place_text_file_with_autoflow() {
+        let dir = std::env::temp_dir().join(format!("dc-place-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("long.txt");
+        let para = "The quick brown fox jumps over the lazy dog, again and again, to fill the page. ".repeat(12);
+        std::fs::write(&path, vec![para.as_str(); 60].join("\n")).unwrap();
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 1})).unwrap();
+        let r = s.execute("file.place", &json!({"path": path.to_string_lossy(), "autoflow": true})).unwrap();
+        assert!(r["pagesAdded"].as_u64().unwrap() >= 2, "{r}");
+        assert_eq!(r["overset"], false);
+        let d = &s.doc().unwrap().doc;
+        let sid = StoryId(r["story"].as_u64().unwrap());
+        assert_eq!(d.story(sid).unwrap().frames.len(), d.page_count());
+        assert_eq!(d.story(sid).unwrap().paras.len(), 60);
+        // Into the insertion point of another frame.
+        let fr = s.execute("frame.create", &json!({"rect": [72, 72, 300, 200], "content": "text", "text": "Start  end"})).unwrap();
+        let sid2 = fr["story"].as_u64().unwrap();
+        s.execute("text.select", &json!({"story": sid2, "anchor": 6, "focus": 6})).unwrap();
+        let small = dir.join("small.rtf");
+        std::fs::write(&small, br"{\rtf1 {\b middle}}").unwrap();
+        s.execute("file.place", &json!({"path": small.to_string_lossy()})).unwrap();
+        let st = s.doc().unwrap().doc.story(StoryId(sid2)).unwrap().clone();
+        assert_eq!(st.text, "Start middle end");
+        assert_eq!(st.format_after(6).over.font_style.as_deref(), Some("Bold"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autoflow_adds_only_the_pages_breaks_ask_for() {
+        // Regression (#262): a frame a break ends early made autoflow take it for a frame that
+        // holds a few characters, and add a page per few characters left (33 for this text).
+        let dir = std::env::temp_dir().join(format!("dc-place-breaks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, rtf, pages) in [
+            ("lead.rtf", r"{\rtf1 \page\par A Short Heading\par First short paragraph.\par Second short paragraph.\par}", 2),
+            ("each.rtf", r"{\rtf1 One\par\page\par Two\par\page\par Three\par\page\par Four\par}", 4),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, rtf).unwrap();
+            let mut s = Session::new();
+            s.execute("file.new", &json!({"pages": 1})).unwrap();
+            let r = s.execute("file.place", &json!({"path": path.to_string_lossy(), "autoflow": true})).unwrap();
+            assert_eq!(r["overset"], false, "{name}: {r}");
+            let d = &s.doc().unwrap().doc;
+            assert_eq!(d.page_count(), pages, "{name}: {r}");
+            assert_eq!(d.story(StoryId(r["story"].as_u64().unwrap())).unwrap().frames.len(), pages, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod place_pdf_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn place_pdf_renders_and_exports_as_vector() {
+        let dir = std::env::temp_dir().join(format!("dc-place-pdf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("ad.pdf");
+        // A PDF made by our own exporter: a black square on a page.
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"width": 200, "height": 100})).unwrap();
+        let id = s.execute("frame.create", &json!({"rect": [0, 0, 100, 100]})).unwrap()["id"].as_u64().unwrap();
+        s.execute("object.fill", &json!({"ids": [id], "swatch": "[Black]"})).unwrap();
+        s.execute("file.exportPdf", &json!({"path": src.to_string_lossy()})).unwrap();
+        // Place it in a new document.
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("file.place", &json!({"path": src.to_string_lossy(), "x": 100, "y": 100})).unwrap();
+        let d = s.doc().unwrap().doc.clone();
+        let it = d.spreads[0].items.last().unwrap();
+        let b = it.bounds();
+        assert!((b.width() - 200.0).abs() < 1.0 && (b.height() - 100.0).abs() < 1.0, "sized by the PDF page: {b:?} {r}");
+        let asset = d.assets.values().next().unwrap();
+        assert_eq!(asset.mime, "application/pdf");
+        // On screen: the square is black, the rest of the placed page white.
+        let mut rr = designcraft_render::Renderer::new();
+        let img = rr.render_page(&d, &s.cache, 0, 1.0, false, &Default::default()).unwrap();
+        assert!(img.pixel(150, 150)[0] < 90, "{:?}", img.pixel(150, 150));
+        assert!(img.pixel(250, 150)[0] > 200, "{:?}", img.pixel(250, 150));
+        // Exported: still a valid PDF, larger than a page without the placed PDF would be.
+        let out = dir.join("out.pdf");
+        s.execute("file.exportPdf", &json!({"path": out.to_string_lossy()})).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let pdf = hayro_syntax::Pdf::new(std::sync::Arc::new(bytes.clone())).expect("valid pdf");
+        assert_eq!(pdf.pages().len(), 1);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/Subtype /Form") || text.contains("/Subtype/Form"), "embedded as a form XObject");
+        assert!(!text.contains("/Subtype /Image") && !text.contains("/Subtype/Image"), "not rasterized");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn place_svg_on_screen_and_as_vectors_in_pdf() {
+        let dir = std::env::temp_dir().join(format!("dc-place-svg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("logo.svg");
+        std::fs::write(
+            &src,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80"><rect width="80" height="80" fill="#0000ff"/></svg>"##,
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("file.place", &json!({"path": src.to_string_lossy(), "x": 100, "y": 100})).unwrap();
+        let d = s.doc().unwrap().doc.clone();
+        let b = d.spreads[0].items.last().unwrap().bounds();
+        assert!((b.width() - 120.0).abs() < 1.0 && (b.height() - 60.0).abs() < 1.0, "160×80 px = 120×60 pt: {b:?}");
+        assert_eq!(d.assets.values().next().unwrap().mime, "image/svg+xml");
+        let mut rr = designcraft_render::Renderer::new();
+        let img = rr.render_page(&d, &s.cache, 0, 1.0, false, &Default::default()).unwrap();
+        let p = img.pixel(130, 130);
+        assert!(p[2] > 200 && p[0] < 60, "blue square on screen: {p:?}");
+        let out = dir.join("out.pdf");
+        s.execute("file.exportPdf", &json!({"path": out.to_string_lossy()})).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        hayro_syntax::Pdf::new(std::sync::Arc::new(bytes.clone())).expect("valid pdf");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("/Subtype /Image") && !text.contains("/Subtype/Image"), "not rasterized");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod reflow_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn smart_text_reflow_adds_and_removes_pages() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 1, "primaryTextFrame": true})).unwrap();
+        let sid = s.doc().unwrap().doc.settings.primary_story.expect("primary story").0;
+        assert_eq!(s.doc().unwrap().doc.story(designcraft_doc::StoryId(sid)).unwrap().frames.len(), 1);
+        s.execute("text.select", &json!({"story": sid, "anchor": 0, "focus": 0})).unwrap();
+        let long = "Words keep coming and the page fills up quickly with them. ".repeat(250);
+        s.execute("text.insert", &json!({"text": long})).unwrap();
+        let pages = s.doc().unwrap().doc.page_count();
+        assert!(pages >= 3, "pages added: {pages}");
+        let d = s.doc().unwrap().doc.clone();
+        assert_eq!(d.story(designcraft_doc::StoryId(sid)).unwrap().frames.len(), pages);
+        // One undo takes the typing and its pages back.
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.page_count(), 1);
+        s.execute("edit.redo", &json!({})).unwrap();
+        // Delete the text: the empty pages at the end go.
+        let n = s.doc().unwrap().doc.story(designcraft_doc::StoryId(sid)).unwrap().len();
+        s.execute("text.select", &json!({"story": sid, "anchor": 0, "focus": n})).unwrap();
+        s.execute("text.delete", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.page_count(), 1);
+        s.doc().unwrap().doc.check().unwrap();
+        // Off: no pages added.
+        s.execute("prefs.set", &json!({"smartTextReflow": false})).unwrap();
+        s.execute("text.insert", &json!({"text": long})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.page_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod pdf_page_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn place_a_chosen_pdf_page() {
+        let dir = std::env::temp_dir().join(format!("dc-pdf-page-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("two.pdf");
+        // Page 1 white, page 2 a different size with a black square.
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 2, "facingPages": false, "width": 200, "height": 100})).unwrap();
+        s.execute("layout.pageSize", &json!({"pages": [2], "width": 300, "height": 150})).unwrap();
+        let id = s.execute("frame.create", &json!({"spread": 1, "rect": [0, 0, 300, 150]})).unwrap()["id"].as_u64().unwrap();
+        s.execute("object.fill", &json!({"ids": [id], "swatch": "[Black]"})).unwrap();
+        s.execute("file.exportPdf", &json!({"path": src.to_string_lossy()})).unwrap();
+        s.execute("file.new", &json!({})).unwrap();
+        assert!(s.execute("file.place", &json!({"path": src.to_string_lossy(), "pdfPage": 3})).is_err());
+        s.execute("file.place", &json!({"path": src.to_string_lossy(), "pdfPage": 2, "x": 100, "y": 100})).unwrap();
+        let d = s.doc().unwrap().doc.clone();
+        let it = d.spreads[0].items.last().unwrap();
+        let b = it.bounds();
+        assert!((b.width() - 300.0).abs() < 1.0 && (b.height() - 150.0).abs() < 1.0, "page 2's size: {b:?}");
+        assert_eq!(d.assets.values().next().unwrap().page, 1);
+        let mut rr = designcraft_render::Renderer::new();
+        rr.threads = 0;
+        let img = rr.render_page(&d, &s.cache, 0, 1.0, false, &Default::default()).unwrap();
+        assert!(img.pixel(250, 170)[0] < 60, "page 2 (black) shows: {:?}", img.pixel(250, 170));
+        let pdf = designcraft_pdf::export_pdf(&d, &s.cache, &Default::default()).unwrap();
+        assert!(String::from_utf8_lossy(&pdf).contains("/Subtype /Form") || String::from_utf8_lossy(&pdf).contains("/Subtype/Form"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markdown_place_maps_styles_and_roundtrips_with_undo() {
+        let b64 = crate::cmd::base64_encode(b"# Head\n\n**Strong** and plain\n\n- Item");
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Headline", "chars": {"size": 30}})).unwrap();
+        s.execute("style.character.create", &json!({"name": "Emphatic", "chars": {"size": 17}})).unwrap();
+        let before = s.doc().unwrap().doc.clone();
+        let info = s.execute("place.styles", &json!({"base64": b64, "name": "a.markdown"})).unwrap();
+        assert!(info["paragraph"].as_array().unwrap().contains(&json!("Heading 1")));
+        assert!(info["character"].as_array().unwrap().contains(&json!("Strong")));
+        let result = s
+            .execute("file.place", &json!({"base64": b64, "name": "a.markdown", "styleMap": {"Heading 1": "Headline", "Strong": "Emphatic"}}))
+            .unwrap();
+        let placed = s.doc().unwrap().doc.clone();
+        let story = placed.story(designcraft_doc::StoryId(result["story"].as_u64().unwrap())).unwrap();
+        assert_eq!(story.text, "Head\nStrong and plain\nItem");
+        assert_eq!(story.paras[0].style, "Headline");
+        assert_eq!(placed.styles.resolve_char(&placed.styles.resolve_para(&story.paras[1]).1, story.format_after(5)).size, 17.0);
+        assert!(placed.styles.para("Heading 1").is_none());
+        assert!(placed.styles.char_style("Strong").is_none());
+        story.check().unwrap();
+        let bytes = designcraft_format::save(&placed).unwrap();
+        assert_eq!(crate::cmd::from_bytes(&bytes).unwrap(), *placed);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *before);
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *placed);
+    }
+
+    fn word_file() -> Vec<u8> {
+        use std::io::Write;
+        const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+        let styles = format!(
+            r#"<w:styles {W}><w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+            <w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:rPr><w:sz w:val="56"/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Body"><w:name w:val="Body"/><w:rPr><w:sz w:val="20"/></w:rPr></w:style></w:styles>"#
+        );
+        let doc = format!(
+            r#"<w:document {W}><w:body><w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t>Head</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p></w:body></w:document>"#
+        );
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        for (n, c) in [("word/document.xml", doc), ("word/styles.xml", styles)] {
+            w.start_file(n, o).unwrap();
+            w.write_all(c.as_bytes()).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn word_import_options_map_and_rename_styles() {
+        let b64 = crate::cmd::base64_encode(&word_file());
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Body", "chars": {"size": 9}})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Headline", "chars": {"size": 30}})).unwrap();
+        let info = s.execute("place.styles", &json!({"base64": b64, "name": "a.docx"})).unwrap();
+        assert_eq!(info["conflicts"], json!(["Body"]));
+        // Title → the document's Headline; Body clashes → imported as Body_wrd_1.
+        let r = s
+            .execute("file.place", &json!({"base64": b64, "name": "a.docx", "styleMap": {"Title": "Headline"}, "styleConflicts": "autoRename"}))
+            .unwrap();
+        let d = &s.doc().unwrap().doc;
+        let st = d.story(designcraft_doc::StoryId(r["story"].as_u64().unwrap())).unwrap();
+        assert_eq!(st.paras.iter().map(|p| p.style.as_str()).collect::<Vec<_>>(), ["Headline", "Body_wrd_1"]);
+        assert!(d.styles.para("Title").is_none(), "mapped styles aren't imported");
+        assert_eq!(d.styles.para("Body").unwrap().chars.size, Some(9.0), "the document's Body is untouched");
+        // Redefine: the imported definition replaces the document's.
+        s.execute("file.place", &json!({"base64": b64, "name": "a.docx", "styleConflicts": "redefine", "rect": [72, 400, 300, 500]})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.styles.para("Body").unwrap().chars.size, Some(10.0));
+    }
+
+    #[test]
+    fn word_normal_comes_in_as_its_own_style() {
+        // Regression (#722): Normal's formatting (over Word's document defaults) was dropped.
+        use std::io::Write;
+        const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+        let styles = format!(
+            r#"<w:styles {W}><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:rFonts w:ascii="Georgia"/><w:sz w:val="26"/></w:rPr></w:style></w:styles>"#
+        );
+        let doc = format!(r#"<w:document {W}><w:body><w:p><w:r><w:t>Plain</w:t></w:r></w:p></w:body></w:document>"#);
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (n, c) in [("word/document.xml", doc), ("word/styles.xml", styles)] {
+            w.start_file(n, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(c.as_bytes()).unwrap();
+        }
+        let b64 = crate::cmd::base64_encode(&w.finish().unwrap().into_inner());
+        let basic = designcraft_doc::story::BASIC_PARAGRAPH;
+        let placed = |s: &Session, story: &serde_json::Value| {
+            let d = &s.doc().unwrap().doc;
+            let st = d.story(designcraft_doc::StoryId(story["story"].as_u64().unwrap())).unwrap();
+            let (_, para_chars) = d.styles.resolve_para(&st.paras[0]);
+            let c = d.styles.resolve_char(&para_chars, st.format_after(0));
+            (st.paras[0].style.clone(), c.size, c.font_family)
+        };
+        let georgia = |style: &str| (style.to_string(), 13.0, "Georgia".to_string());
+        // Default options: the document gains Normal and the text looks as it did in Word.
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let info = s.execute("place.styles", &json!({"base64": b64, "name": "a.docx"})).unwrap();
+        assert_eq!(info["paragraph"], json!(["Normal"]));
+        assert_eq!(info["conflicts"], json!([]));
+        let r = s.execute("file.place", &json!({"base64": b64, "name": "a.docx"})).unwrap();
+        assert_eq!(placed(&s, &r), georgia("Normal"));
+        assert!(s.doc().unwrap().doc.styles.para(basic).unwrap().chars.is_empty(), "[Basic Paragraph] untouched");
+        // Normal mapped to [Basic Paragraph]: no new style, and the document's definition is used
+        // (mapped styles aren't imported, whatever the conflict option).
+        s.execute("file.new", &json!({})).unwrap();
+        let r =
+            s.execute("file.place", &json!({"base64": b64, "name": "a.docx", "styleMap": {"Normal": basic}, "styleConflicts": "redefine"})).unwrap();
+        assert!(s.doc().unwrap().doc.styles.para("Normal").is_none());
+        assert!(s.doc().unwrap().doc.styles.para(basic).unwrap().chars.is_empty());
+        let (style, size, _) = placed(&s, &r);
+        assert_eq!((style.as_str(), size), (basic, 12.0));
+        // A document with its own Normal: the usual conflict rules.
+        s.execute("style.paragraph.create", &json!({"name": "Normal", "chars": {"size": 9}})).unwrap();
+        let r = s.execute("file.place", &json!({"base64": b64, "name": "a.docx", "rect": [72, 400, 300, 500]})).unwrap();
+        assert_eq!(placed(&s, &r).1, 9.0, "use existing");
+        let r =
+            s.execute("file.place", &json!({"base64": b64, "name": "a.docx", "styleConflicts": "autoRename", "rect": [72, 520, 300, 600]})).unwrap();
+        assert_eq!(placed(&s, &r), georgia("Normal_wrd_1"));
+    }
+}
+
+#[cfg(test)]
+mod markdown_emphasis_tests {
+    use super::*;
+
+    const SOURCE: &str = "# plain *em* *`code`* **strong** ***both*** *~~struck~~* tail";
+
+    fn assert_heading(s: &Session, result: &Value, style: &str, weight: &str, size: f64) {
+        let d = &s.doc().unwrap().doc;
+        let story = d.story(StoryId(result["story"].as_u64().unwrap())).unwrap();
+        assert_eq!(story.text, "plain em code strong both struck tail");
+        assert_eq!(story.paras[0].style, style);
+        let (_, base) = d.styles.resolve_para(&story.paras[0]);
+        assert_eq!(base.font_style, weight);
+        let italic = if weight == "Bold" { "Bold Italic" } else { "Italic" };
+        for (word, expected) in
+            [("plain", weight), ("em", italic), ("code", italic), ("strong", "Bold"), ("both", "Bold Italic"), ("struck", italic), ("tail", weight)]
+        {
+            let format = story.format_after(story.text.find(word).unwrap());
+            let actual = d.styles.resolve_char(&base, format);
+            assert_eq!(actual.font_style, expected, "{style}: {word}");
+            assert_eq!(actual.size, size, "{style}: {word}");
+        }
+        let em = story.format_after(story.text.find("em").unwrap());
+        assert_eq!(em.style, "Emphasis", "italic markup must remain distinct from explicit strong");
+        assert_eq!(em.over.font_style.as_deref(), (weight == "Bold").then_some("Bold Italic"));
+        let strong = story.format_after(story.text.find("strong").unwrap());
+        assert_eq!(strong.style, "Strong");
+        assert!(strong.over.is_empty());
+        let code = story.format_after(story.text.find("code").unwrap());
+        assert_eq!(d.styles.resolve_char(&base, code).font_family, "JetBrains Mono");
+        let struck = story.format_after(story.text.find("struck").unwrap());
+        assert!(d.styles.resolve_char(&base, struck).strikethrough);
+        story.check().unwrap();
+    }
+
+    #[test]
+    fn mapped_regular_heading_keeps_emphasis_and_explicit_strong_through_roundtrip_and_undo() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        // Read the destination's inherited weight rather than its name or sparse attrs.
+        s.execute("style.paragraph.create", &json!({"name": "Regular Base", "chars": {"font_style": "Regular"}})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Headline", "basedOn": "Regular Base", "chars": {"size": 30}})).unwrap();
+        let before = s.doc().unwrap().doc.clone();
+        let result = s
+            .execute(
+                "file.place",
+                &json!({"name": "heading.md", "base64": crate::cmd::base64_encode(SOURCE.as_bytes()), "styleMap": {"Heading 1": "Headline"}}),
+            )
+            .unwrap();
+        assert_heading(&s, &result, "Headline", "Regular", 30.0);
+        let placed = s.doc().unwrap().doc.clone();
+        assert!(placed.styles.para("Heading 1").is_none());
+        let bytes = designcraft_format::save(&placed).unwrap();
+        assert_eq!(crate::cmd::from_bytes(&bytes).unwrap(), *placed);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *before);
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *placed);
+        assert_heading(&s, &result, "Headline", "Regular", 30.0);
+    }
+
+    #[test]
+    fn existing_regular_heading_keeps_emphasis_and_explicit_strong() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Heading 1", "chars": {"font_style": "Regular", "size": 30}})).unwrap();
+        let result = s.execute("file.place", &json!({"name": "heading.MARKDOWN", "base64": crate::cmd::base64_encode(SOURCE.as_bytes())})).unwrap();
+        assert_heading(&s, &result, "Heading 1", "Regular", 30.0);
+    }
+
+    #[test]
+    fn bold_destination_defaults_and_conflict_policies_keep_bold_italic_emphasis() {
+        for conflict in ["useExisting", "redefine", "autoRename"] {
+            let mut s = Session::new();
+            s.execute("file.new", &json!({})).unwrap();
+            s.execute(
+                "style.paragraph.create",
+                &json!({"name": "Heading 1", "chars": {"font_style": if conflict == "useExisting" { "Bold" } else { "Regular" }, "size": 30}}),
+            )
+            .unwrap();
+            let result = s
+                .execute(
+                    "file.place",
+                    &json!({"name": "heading.md", "base64": crate::cmd::base64_encode(SOURCE.as_bytes()), "styleConflicts": conflict}),
+                )
+                .unwrap();
+            let name = if conflict == "autoRename" { "Heading 1_wrd_1" } else { "Heading 1" };
+            assert_heading(&s, &result, name, "Bold", if conflict == "useExisting" { 30.0 } else { 24.0 });
+        }
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Headline", "chars": {"font_style": "Bold", "size": 30}})).unwrap();
+        let result = s
+            .execute(
+                "file.place",
+                &json!({"name": "heading.md", "base64": crate::cmd::base64_encode(SOURCE.as_bytes()), "styleMap": {"Heading 1": "Headline"}}),
+            )
+            .unwrap();
+        assert_heading(&s, &result, "Headline", "Bold", 30.0);
+    }
+
+    #[test]
+    fn caret_insertion_uses_the_surviving_destination_paragraph_weight() {
+        for weight in ["Regular", "Bold"] {
+            let mut s = Session::new();
+            s.execute("file.new", &json!({})).unwrap();
+            s.execute("style.paragraph.create", &json!({"name": "Target", "chars": {"font_style": weight, "size": 30}})).unwrap();
+            let frame = s.execute("frame.create", &json!({"rect": [72, 72, 300, 200], "content": "text", "text": "before  after"})).unwrap();
+            let sid = frame["story"].as_u64().unwrap();
+            s.execute("text.select", &json!({"story": sid, "anchor": 7, "focus": 7})).unwrap();
+            s.execute("style.paragraph.apply", &json!({"name": "Target"})).unwrap();
+            s.execute("file.place", &json!({"name": "heading.md", "base64": crate::cmd::base64_encode(b"# *em* **strong**")})).unwrap();
+            let d = &s.doc().unwrap().doc;
+            let story = d.story(StoryId(sid)).unwrap();
+            assert_eq!(story.text, "before em strong after");
+            assert_eq!(story.paras[0].style, "Target");
+            let (_, base) = d.styles.resolve_para(&story.paras[0]);
+            let em = d.styles.resolve_char(&base, story.format_after(7));
+            assert_eq!(em.font_style, if weight == "Bold" { "Bold Italic" } else { "Italic" });
+            assert_eq!(em.size, 30.0);
+            let strong = d.styles.resolve_char(&base, story.format_after(10));
+            assert_eq!(strong.font_style, "Bold");
+            assert_eq!(strong.size, 30.0);
+            story.check().unwrap();
+        }
+    }
+
+    #[test]
+    fn bold_mapped_body_style_adds_its_actual_weight_to_emphasis() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Bold Body", "chars": {"font_style": "Bold"}})).unwrap();
+        let result = s
+            .execute(
+                "file.place",
+                &json!({"name": "body.md", "base64": crate::cmd::base64_encode(b"*em* **strong**"), "styleMap": {"Body Text": "Bold Body"}}),
+            )
+            .unwrap();
+        let d = &s.doc().unwrap().doc;
+        let story = d.story(StoryId(result["story"].as_u64().unwrap())).unwrap();
+        let (_, base) = d.styles.resolve_para(&story.paras[0]);
+        assert_eq!(story.paras[0].style, "Bold Body");
+        assert_eq!(d.styles.resolve_char(&base, story.format_after(0)).font_style, "Bold Italic");
+        assert_eq!(d.styles.resolve_char(&base, story.format_after(3)).font_style, "Bold");
+    }
+
+    #[test]
+    fn rtf_sniffed_from_markdown_filename_retains_its_local_font_style() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let result = s.execute("file.place", &json!({"name": "sniffed.md", "base64": crate::cmd::base64_encode(br"{\rtf1 {\b\i em}}")})).unwrap();
+        let d = &s.doc().unwrap().doc;
+        let story = d.story(StoryId(result["story"].as_u64().unwrap())).unwrap();
+        assert_eq!(story.text, "em");
+        assert_eq!(story.format_after(0).over.font_style.as_deref(), Some("Bold Italic"));
+    }
+
+    #[test]
+    fn explicit_character_mapping_and_remove_styles_override_inherited_weight() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.character.create", &json!({"name": "Custom Emphasis", "chars": {"font_style": "Regular", "size": 18}})).unwrap();
+        let result = s
+            .execute(
+                "file.place",
+                &json!({"name": "heading.md", "base64": crate::cmd::base64_encode(b"# *em* **strong**"), "styleMap": {"Emphasis": "Custom Emphasis"}}),
+            )
+            .unwrap();
+        let d = &s.doc().unwrap().doc;
+        let story = d.story(StoryId(result["story"].as_u64().unwrap())).unwrap();
+        let (_, base) = d.styles.resolve_para(&story.paras[0]);
+        assert_eq!(base.font_style, "Bold");
+        let em = story.format_after(0);
+        assert_eq!(em.style, "Custom Emphasis");
+        assert!(em.over.is_empty());
+        let chars = d.styles.resolve_char(&base, em);
+        assert_eq!(chars.font_style, "Regular");
+        assert_eq!(chars.size, 18.0);
+        assert_eq!(d.styles.resolve_char(&base, story.format_after(3)).font_style, "Bold");
+        let result = s
+            .execute("file.place", &json!({"name": "heading.md", "base64": crate::cmd::base64_encode(SOURCE.as_bytes()), "removeStyles": true}))
+            .unwrap();
+        let story = s.doc().unwrap().doc.story(StoryId(result["story"].as_u64().unwrap())).unwrap();
+        assert_eq!(story.paras[0].style, designcraft_doc::BASIC_PARAGRAPH);
+        assert!(story.chars.iter().all(|run| run.format.style == designcraft_doc::NO_CHAR_STYLE && run.format.over.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod r8_unmatched_table_session_tests {
+    use designcraft_doc::{CharFormat, StoryId};
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn r8_unmatched_header_public_session_full_doc_undo_redo_and_native_zip() {
+        let source = "**A**|`B\n---|---\n*C*|*D*";
+        for map_body in [false, true] {
+            let mut s = Session::new();
+            s.execute("file.new", &json!({})).unwrap();
+            s.execute("style.paragraph.create", &json!({"name": "Existing Body", "chars": {"size": 18, "font_style": "Bold"}})).unwrap();
+            let before = s.doc().unwrap().doc.clone();
+            let mut params = json!({"name": "unmatched-header.md", "base64": "KipBKip8YEIKLS0tfC0tLQoqQyp8KkQq"});
+            if map_body {
+                params["styleMap"] = json!({"Body Text": "Existing Body"});
+            }
+            let r = s.execute("file.place", &params).unwrap();
+            let sid = StoryId(r["story"].as_u64().unwrap());
+            let placed = s.doc().unwrap().doc.clone();
+            let story = placed.story(sid).unwrap();
+            assert_eq!(story.text, source);
+            assert_eq!(story.paras.len(), 3);
+            let style = if map_body { "Existing Body" } else { "Body Text" };
+            assert!(story.paras.iter().all(|p| p.style == style && p.table.is_none()));
+            for (at, _) in source.char_indices() {
+                assert_eq!(story.format_after(at), &CharFormat::default());
+            }
+            assert_eq!(placed.styles.character, before.styles.character);
+            assert_eq!(r["warnings"], json!(["Markdown quotes, tables, HTML, references and thematic breaks were kept as source text."]));
+            placed.check().unwrap();
+
+            s.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(*s.doc().unwrap().doc, *before, "undo must restore the entire pre-placement document");
+            s.execute("edit.redo", &json!({})).unwrap();
+            assert_eq!(*s.doc().unwrap().doc, *placed, "redo must restore the entire literal import");
+
+            let serialized = s.execute("file.serialize", &json!({})).unwrap();
+            let bytes = crate::cmd::file::base64_decode(serialized["base64"].as_str().unwrap());
+            assert!(bytes.starts_with(b"PK"), "exercise native ZIP bytes rather than a legacy JSON document");
+            let mut reopened = Session::new();
+            reopened.execute("file.openBytes", &json!({"base64": serialized["base64"]})).unwrap();
+            assert_eq!(*reopened.doc().unwrap().doc, *placed, "public native reopen must retain the complete document");
+            assert_eq!(reopened.doc().unwrap().doc.story(sid).unwrap().text, source);
+            reopened.doc().unwrap().doc.check().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "place_text_review9_tests.rs"]
+mod place_text_review9_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod linked_markdown_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+
+    fn setup(case: &str, source: &str) -> (Session, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dc-linked-markdown-{case}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chapter.md");
+        std::fs::write(&path, source).unwrap();
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        (s, path)
+    }
+
+    fn placed(s: &mut Session, path: &Path, map: Value, conflict: &str) -> StoryId {
+        let result =
+            s.execute("file.place", &json!({"path": path.to_string_lossy(), "link": true, "styleMap": map, "styleConflicts": conflict})).unwrap();
+        assert_eq!(result["warnings"], json!([]));
+        StoryId(result["story"].as_u64().unwrap())
+    }
+
+    fn assert_text(s: &Session, sid: StoryId, text: &str, expected: (&str, &str, &str)) {
+        let d = &s.doc().unwrap().doc;
+        let story = d.story(sid).unwrap();
+        assert_eq!(story.text, text);
+        assert_eq!(story.paras[0].style, expected.0);
+        assert_eq!(story.format_after(0).style, expected.1);
+        let (_, base) = d.styles.resolve_para(&story.paras[0]);
+        assert_eq!(d.styles.resolve_char(&base, story.format_after(0)).font_style, expected.2);
+        let strong = story.format_after(text.find("strong").unwrap());
+        assert_eq!(strong.style, "Strong");
+        assert_eq!(d.styles.resolve_char(&base, strong).font_style, "Bold");
+        assert!(story.file_link.is_some());
+        d.check().unwrap();
+    }
+
+    fn reopen(s: &Session) -> Session {
+        let before = s.doc().unwrap().doc.clone();
+        let bytes = designcraft_format::save(&before).unwrap();
+        let mut opened = Session::new();
+        opened.execute("file.openBytes", &json!({"base64": crate::cmd::base64_encode(&bytes)})).unwrap();
+        assert_eq!(*opened.doc().unwrap().doc, *before, "native archive preserves the whole document and link options");
+        opened
+    }
+
+    fn replay(mut s: Session, path: PathBuf, sid: StoryId, prefix: &str, expected: (&str, &str, &str), automatic: Value) {
+        assert_text(&s, sid, "first strong", expected);
+        s = reopen(&s);
+        let before = s.doc().unwrap().doc.clone();
+        // Different byte counts make Update Link independent of timestamp resolution/cache age.
+        std::fs::write(&path, format!("{prefix}*second-long* **strong**")).unwrap();
+        let result = s.execute("links.update", &json!({"story": sid.0})).unwrap();
+        assert_eq!(result["updated"], 1, "the actual linked-file update must run");
+        assert_eq!(result["warnings"], json!([]));
+        assert_text(&s, sid, "second-long strong", expected);
+        let updated = s.doc().unwrap().doc.clone();
+        assert_eq!(updated.spreads, before.spreads);
+        assert_eq!(updated.styles, before.styles, "no second Auto Rename or replacement of document styles");
+        assert_eq!(updated.story(sid).unwrap().frames, before.story(sid).unwrap().frames);
+        let old_link = before.story(sid).unwrap().file_link.as_ref().unwrap();
+        let link = updated.story(sid).unwrap().file_link.as_ref().unwrap();
+        assert_eq!(link.style_map, old_link.style_map);
+        assert_ne!(link.hash, old_link.hash);
+        assert_eq!(serde_json::to_value(link).unwrap()["autoRenamedStyles"], automatic);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *before);
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *updated);
+        s = reopen(&s);
+        let moved = path.with_file_name("moved.markdown");
+        std::fs::write(&moved, format!("{prefix}*third-relinked* **strong**")).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let result = s.execute("links.relink", &json!({"story": sid.0, "path": moved.to_string_lossy()})).unwrap();
+        assert_eq!(result["warnings"], json!([]));
+        assert_text(&s, sid, "third-relinked strong", expected);
+        let relinked = s.doc().unwrap().doc.clone();
+        assert_eq!(relinked.spreads, updated.spreads);
+        assert_eq!(relinked.styles, updated.styles);
+        assert_eq!(relinked.story(sid).unwrap().frames, updated.story(sid).unwrap().frames);
+        let link = relinked.story(sid).unwrap().file_link.as_ref().unwrap();
+        assert_eq!(link.path, moved.to_string_lossy());
+        assert_eq!(link.style_map, old_link.style_map);
+        assert_eq!(serde_json::to_value(link).unwrap()["autoRenamedStyles"], automatic);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *updated);
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().doc, *relinked);
+        let _ = reopen(&s);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn mapped_regular_heading_stays_italic_on_link_update_and_relink() {
+        let (mut s, path) = setup("regular", "# *first* **strong**");
+        s.execute("style.paragraph.create", &json!({"name": "Headline", "chars": {"font_style": "Regular"}})).unwrap();
+        let sid = placed(&mut s, &path, json!({"Heading 1": "Headline"}), "useExisting");
+        replay(s, path, sid, "# ", ("Headline", "Emphasis", "Italic"), Value::Null);
+    }
+
+    fn mapped_body(case: &str, explicit: bool) -> (Session, PathBuf, StoryId) {
+        let (mut s, path) = setup(case, "*first* **strong**");
+        s.execute("style.paragraph.create", &json!({"name": "Bold Body", "chars": {"font_style": "Bold"}})).unwrap();
+        s.execute("style.character.create", &json!({"name": "Emphasis", "chars": {"font_style": "Regular"}})).unwrap();
+        s.execute("style.character.create", &json!({"name": "Strong", "chars": {"font_style": "Bold"}})).unwrap();
+        let mut map = json!({"Body Text": "Bold Body", "Strong": "Strong"});
+        if explicit {
+            // Deliberately use Auto Rename's exact spelling and the same italic definition.
+            s.execute("style.character.create", &json!({"name": "Emphasis_wrd_1", "chars": {"font_style": "Italic"}})).unwrap();
+            map["Emphasis"] = json!("Emphasis_wrd_1");
+        }
+        let sid = placed(&mut s, &path, map, "autoRename");
+        let link = s.doc().unwrap().doc.story(sid).unwrap().file_link.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(&link.style_map).unwrap(),
+            json!({"Body Text": "Bold Body", "Emphasis": "Emphasis_wrd_1", "Strong": "Strong"})
+        );
+        (s, path, sid)
+    }
+
+    #[test]
+    fn automatic_character_rename_keeps_inherited_bold_on_link_update_and_relink() {
+        let (s, path, sid) = mapped_body("automatic", false);
+        replay(s, path, sid, "", ("Bold Body", "Emphasis_wrd_1", "Bold Italic"), json!(["Emphasis"]));
+    }
+
+    #[test]
+    fn explicit_character_map_with_automatic_spelling_keeps_its_italic_definition() {
+        let (s, path, sid) = mapped_body("explicit", true);
+        replay(s, path, sid, "", ("Bold Body", "Emphasis_wrd_1", "Italic"), Value::Null);
+    }
+
+    #[test]
+    fn legacy_link_without_mapping_provenance_roundtrips_and_keeps_effective_map_priority() {
+        let (s, path, sid) = mapped_body("legacy", false);
+        assert_text(&s, sid, "first strong", ("Bold Body", "Emphasis_wrd_1", "Bold Italic"));
+        // Old records cannot distinguish an automatic name from an explicit map to that name.
+        // Missing provenance must load unchanged and must not guess from the _wrd_1 suffix.
+        let mut legacy = serde_json::to_value(&*s.doc().unwrap().doc).unwrap();
+        let link = legacy["stories"][sid.0.to_string()]["fileLink"].as_object_mut().unwrap();
+        link.remove("autoRenamedStyles");
+        let original_link = Value::Object(link.clone());
+        let parsed: TextFileLink = serde_json::from_value(original_link.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), original_link, "legacy link JSON is preserved exactly");
+        // The legacy link record predates mapping provenance, not native format v2.
+        // Keep its missing provenance field inside a current-version native archive.
+        let legacy_doc: designcraft_doc::Document = serde_json::from_value(legacy.clone()).unwrap();
+        let bytes = designcraft_format::save(&legacy_doc).unwrap();
+        assert!(bytes.starts_with(b"PK\x03\x04"));
+        let mut opened = Session::new();
+        opened.execute("file.openBytes", &json!({"base64": crate::cmd::base64_encode(&bytes)})).unwrap();
+        assert_eq!(serde_json::to_value(&*opened.doc().unwrap().doc).unwrap(), legacy);
+        let mut opened = reopen(&opened);
+        let before = opened.doc().unwrap().doc.clone();
+        std::fs::write(&path, "*second-long* **strong**").unwrap();
+        let result = opened.execute("links.update", &json!({"story": sid.0})).unwrap();
+        assert_eq!(result["updated"], 1);
+        assert_text(&opened, sid, "second-long strong", ("Bold Body", "Emphasis_wrd_1", "Italic"));
+        let updated = opened.doc().unwrap().doc.clone();
+        let link = updated.story(sid).unwrap().file_link.as_ref().unwrap();
+        assert_eq!(serde_json::to_value(&link.style_map).unwrap(), original_link["styleMap"]);
+        assert_eq!(serde_json::to_value(link).unwrap()["autoRenamedStyles"], Value::Null);
+        opened.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(*opened.doc().unwrap().doc, *before);
+        opened.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(*opened.doc().unwrap().doc, *updated);
+        let _ = reopen(&opened);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}

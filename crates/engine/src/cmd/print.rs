@@ -42,12 +42,17 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn print_options(s: &Session, p: &Value) -> Result<designcraft_pdf::PdfOptions> {
+    super::export::options(p, s.doc()?.doc.page_count())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn print_with(
     s: &mut Session,
     p: &Value,
     submit: impl FnOnce(&[u8], &craft_print::Job) -> std::result::Result<String, craft_print::Error>,
 ) -> Result<Value> {
-    let opts = super::export::options(p, s.doc()?.doc.page_count())?;
+    let opts = print_options(s, p)?;
     print_with_options(s, p, &opts, submit)
 }
 
@@ -106,7 +111,7 @@ mod tests {
         let mut s = Session::new();
         s.execute("file.new", &json!({"pages": 4})).unwrap();
         let params = json!({"printer": "Office (east)", "copies": 2, "pages": "2-3", "marks": true, "bleed": true});
-        let mut options = super::super::export::options(&params, s.doc().unwrap().doc.page_count()).unwrap();
+        let mut options = print_options(&s, &params).unwrap();
         // Both exports use the production options, with only the metadata clock pinned.
         options.created = Some(1_700_000_000);
         let expected = {
